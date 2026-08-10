@@ -6,6 +6,12 @@ __pycache__/
 # C extensions
 *.so
 
+# C++ build directories (ggml vendored builds)
+/build*/
+# Quantized gguf model files stay out of version control (large binaries),
+# but keep the models/gguf/ directory itself tracked via .gitkeep.
+models/gguf/*.gguf
+
 # Distribution / packaging
 .Python
 build/
@@ -39,5 +45,12 @@ figures*/
 
 # Useless Files
 *.sh
+# benchmark runner is a tracked source script (re-include)
+!benchmarks/run_bench.sh
 blender/
 .restore/
+*.cache/
+*__pycache__*
+*.bin
+*.obj
+*.log
