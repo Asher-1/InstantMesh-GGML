@@ -1,0 +1,45 @@
+// Minimal GGUF reader used across model loaders.
+//
+// Models are stored as GGUF (see convert/). Every model writes a
+// `general.architecture` tag plus its own hparams KV block; the loader reads
+// metadata first, then allocates weights on the chosen backend and streams the
+// payloads directly from file (the standard llama.cpp / stable-diffusion.cpp
+// path: `no_alloc = true` then `ggml_backend_tensor_alloc`).
+#ifndef INSTANTMESH_CORE_GGUF_IO_HPP
+#define INSTANTMESH_CORE_GGUF_IO_HPP
+
+#include <cstdint>
+#include <string>
+#include <unordered_map>
+
+#include "ggml.h"
+#include "ggml-backend.h"
+#include "gguf.h"
+
+namespace instantmesh {
+
+// RAII wrapper around a gguf_context + ggml_context.
+struct GgufModel {
+    gguf_context * gguf = nullptr;
+    ggml_context * ctx  = nullptr;
+    // name -> tensor (built once at load for O(1) graph wiring later).
+    std::unordered_map<std::string, ggml_tensor *> tensors;
+
+    ~GgufModel();
+};
+
+// KV readers with defaults (return `def` if the key is absent).
+uint32_t kv_u32(const gguf_context * g, const char * key, uint32_t def);
+int32_t  kv_i32(const gguf_context * g, const char * key, int32_t def);
+float    kv_f32(const gguf_context * g, const char * key, float def);
+bool     kv_bool(const gguf_context * g, const char * key, bool def);
+const char * kv_str(const gguf_context * g, const char * key, const char * def);
+
+// Opens a GGUF, allocates all tensors on `backend`, and fills `tensors`.
+// Returns false (and sets `error`) on failure.
+bool load_gguf(const std::string & path, ggml_backend_t backend,
+               GgufModel & out, std::string * error);
+
+} // namespace instantmesh
+
+#endif // INSTANTMESH_CORE_GGUF_IO_HPP
