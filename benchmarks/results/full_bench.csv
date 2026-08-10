@@ -1,0 +1,12 @@
+image,backend,precision,time_ms,fps,mem_mb,power_w,wat_per_fps
+cute_horse,pytorch-cuda,f32,13721.1,0.07,3725.2,40.5,556.168
+cute_horse,ggml-cpu,f32,24756.5,0.04,3352.3,73.0,1806.879
+cute_horse,ggml-cuda,f32,3489.9,0.29,1010.9,51.0,178.147
+cute_horse,ggml-vulkan,f32,3977.5,0.25,1517.0,63.0,250.494
+cute_horse,pytorch-cuda,f16,13483.5,0.07,3724.7,44.1,594.886
+cute_horse,ggml-cpu,f16,24445.8,0.04,2973.2,78.9,1927.592
+cute_horse,ggml-cuda,f16,3016.8,0.33,1028.1,51.4,154.969
+cute_horse,ggml-vulkan,f16,3493.9,0.29,1517.5,63.6,222.373
+cute_horse,ggml-cpu,q8,23491.5,0.04,2626.2,75.4,1771.335
+cute_horse,ggml-cuda,q8,2894.8,0.35,1014.8,50.6,146.425
+cute_horse,ggml-vulkan,q8,3378.5,0.3,1516.7,64.6,218.129

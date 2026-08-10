@@ -35,12 +35,19 @@ add_library(instantmesh_core STATIC
     src/models/dino.cpp
     src/models/lrm_transformer.cpp
     src/models/synthesizer.cpp
-    src/models/flexicubes.cpp)
+    src/models/flexicubes.cpp
+    src/models/texture_map.cpp
+    src/models/xatlas/xatlas.cpp)
 target_include_directories(instantmesh_core PUBLIC src)
 target_link_libraries(instantmesh_core PUBLIC ${INSTANTMESH_GGML_TARGET})
 target_compile_features(instantmesh_core PUBLIC cxx_std_17)
 find_package(Threads REQUIRED)
 target_link_libraries(instantmesh_core PRIVATE Threads::Threads)
+find_package(OpenMP QUIET)
+if(OpenMP_CXX_FOUND)
+    target_link_libraries(instantmesh_core PRIVATE OpenMP::OpenMP_CXX)
+    target_compile_definitions(instantmesh_core PRIVATE IM_USE_OPENMP=1)
+endif()
 
 # ─────────────────────────────────────────────────────────────────────────
 # CLI tools (example programs; images live in examples/)
@@ -81,4 +88,8 @@ if(INSTANTMESH_BUILD_TESTS)
     add_executable(test_cont_permute tests/test_cont_permute.cpp)
     target_link_libraries(test_cont_permute PRIVATE instantmesh_core)
     add_test(NAME test_cont_permute COMMAND test_cont_permute)
+
+    add_executable(test_texture_map tests/test_texture_map.cpp)
+    target_link_libraries(test_texture_map PRIVATE instantmesh_core)
+    add_test(NAME test_texture_map COMMAND test_texture_map)
 endif()

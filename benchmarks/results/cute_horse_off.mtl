@@ -1,0 +1,4 @@
+newmtl mat
+Ka 1 1 1
+Kd 1 1 1
+map_Kd cute_horse_official_tex.png
