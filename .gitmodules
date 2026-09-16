@@ -1,3 +1,6 @@
 [submodule "third_party/ggml"]
-	path = third_party/ggml
+	path = cpp_ggml/third_party/ggml
 	url = https://github.com/ggml-org/ggml.git
+[submodule "cpp_ggml/third_party/RMBG-2.0-GGML"]
+	path = cpp_ggml/third_party/RMBG-2.0-GGML
+	url = https://github.com/Asher-1/RMBG-2.0-GGML.git

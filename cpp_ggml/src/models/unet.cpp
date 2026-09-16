@@ -1,0 +1,614 @@
+// UNet2DConditionModel + RefOnly attention. See unet.hpp for the structure
+// and layout contract (same as vae.cpp: one contiguous [W,H,C,B] world).
+//
+// Numerics mirror diffusers 0.39 UNet2DConditionModel with
+//   attention_head_dim=[5,10,20,20] (= heads per level; head_dim 64),
+//   use_linear_projection, norm_eps 1e-5, GEGLU ff, downsample_padding=1
+//   (SYMMETRIC — the VAE's asymmetric downsample is a VAE-only quirk).
+// RefOnly: w-pass stores every attn1's post-norm hidden states; r-pass runs
+// attn1 as cross-attention with K/V source cat(h_r, h_w). Both passes live
+// in one graph so the w intermediates feed the r K/V directly.
+#include "models/unet.hpp"
+
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <string>
+#include <tuple>
+#include <vector>
+
+#include "ggml-alloc.h"
+#include "ggml-cpu.h"
+
+namespace instantmesh {
+
+namespace {
+
+ggml_tensor * get_t(const UnetModel & m, const std::string & name) {
+    auto it = m.gguf.tensors.find(name);
+    if (it == m.gguf.tensors.end()) {
+        std::fprintf(stderr, "unet: missing tensor '%s'\n", name.c_str());
+        std::abort();
+    }
+    return it->second;
+}
+bool has_t(const UnetModel & m, const std::string & name) {
+    return m.gguf.tensors.count(name) != 0;
+}
+
+// resnet-internal dump points (IM_VAE_DUMP), flushed after compute; NCHW bytes.
+// CRITICAL: the cont copy is expanded into the graph IMMEDIATELY — dumps that
+// wait at the graph tail read sources whose buffers gallocr has already
+// recycled (sources die right after their direct consumers run).
+static std::vector<ggml_tensor *> g_u_dump_t;
+static std::vector<std::string> g_u_dump_nm;
+static bool g_u_dump = false;
+static ggml_cgraph * g_u_gf = nullptr;
+static std::string g_u_pass = "w"; // dump-name prefix: "w"/"r"
+static void u_mark(ggml_context * ctx, ggml_tensor * t, const std::string & nm) {
+    if (g_u_dump) {
+        ggml_tensor * d = ggml_cont(ctx, t);
+        g_u_dump_t.push_back(d); g_u_dump_nm.push_back(g_u_pass + "." + nm);
+        ggml_build_forward_expand(g_u_gf, d);
+    }
+}
+
+// torch GroupNorm(G, eps) + affine on [W,H,C,B] contiguous, built from
+// explicit reductions. (The library ggml_group_norm computes this exact math
+// correctly in isolation but misbehaves inside the large UNet graph for
+// reasons that resisted five dump rounds — the primitive composition here is
+// verifiable end-to-end, so it replaces the op throughout this model.)
+//   sums = ones[WH]·[WH, C*B]  → per-channel spatial sums
+//   group sums via reshape [cpg, G, B] and ones[cpg]·  → mean/var per (g,b)
+//   expand per-group scalars back per-channel → normalize + affine.
+static std::vector<ggml_tensor *> g_u_fill_ones_wh;   // host-filled with 1.0f
+static std::vector<ggml_tensor *> g_u_fill_ones_cpg;
+static std::vector<ggml_tensor *> g_u_fill_eps;
+static std::vector<ggml_tensor *> g_u_fill_ones_gb;
+static std::vector<std::tuple<ggml_tensor *, ggml_tensor *, std::string>> g_u_gn2_dump;
+ggml_tensor * gn32(ggml_context * ctx, const UnetModel & m, ggml_tensor * x,
+                   const std::string & affine_prefix) {
+    const int64_t Wd = x->ne[0], Hd = x->ne[1], C = x->ne[2], B = x->ne[3];
+    const int64_t WH = Wd * Hd;
+    const int64_t G = m.hp.norm_num_groups;
+    const int64_t cpg = C / G;
+    ggml_tensor * ones_wh  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, WH, 1);
+    ggml_tensor * ones_cpg = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, cpg, 1);
+    ggml_set_input(ones_wh); ggml_set_input(ones_cpg);
+    g_u_fill_ones_wh.push_back(ones_wh);
+    g_u_fill_ones_cpg.push_back(ones_cpg);
+
+    ggml_tensor * t  = ggml_reshape_2d(ctx, x, WH, C * B);           // view
+    ggml_tensor * sums  = ggml_mul_mat(ctx, ones_wh, t);             // [1, C*B]
+    ggml_tensor * sq    = ggml_mul(ctx, t, t);
+    ggml_tensor * sums2 = ggml_mul_mat(ctx, ones_wh, sq);            // [1, C*B]
+    ggml_tensor * s3  = ggml_reshape_3d(ctx, sums,  cpg, G, B);
+    ggml_tensor * s23 = ggml_reshape_3d(ctx, sums2, cpg, G, B);
+    ggml_tensor * gs  = ggml_mul_mat(ctx, ones_cpg, s3);             // [1, G, B]
+    ggml_tensor * gs2 = ggml_mul_mat(ctx, ones_cpg, s23);            // [1, G, B]
+    const float inv_n = 1.0f / (float)(cpg * WH);
+    ggml_tensor * mean_g = ggml_scale(ctx, gs,  inv_n);
+    ggml_tensor * ex_g   = ggml_scale(ctx, gs2, inv_n);              // E[x^2]
+    ggml_tensor * var_g  = ggml_sub(ctx, ex_g, ggml_mul(ctx, mean_g, mean_g));
+    ggml_tensor * eps_t  = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 1, G, B);
+    ggml_set_input(eps_t);
+    g_u_fill_eps.push_back(eps_t);
+    ggml_tensor * ones_gb = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 1, G, B);
+    ggml_set_input(ones_gb);
+    g_u_fill_ones_gb.push_back(ones_gb);
+    ggml_tensor * scale_g = ggml_div(ctx, ones_gb,
+                                     ggml_sqrt(ctx, ggml_add(ctx, var_g, eps_t)));
+    // expand per-group [1,G,B] scalars to per-channel [C,B]
+    ggml_tensor * mean_c  = ggml_repeat(ctx, mean_g,  ggml_new_tensor_3d(ctx, GGML_TYPE_F32, cpg, G, B));
+    ggml_tensor * scale_c = ggml_repeat(ctx, scale_g, ggml_new_tensor_3d(ctx, GGML_TYPE_F32, cpg, G, B));
+    mean_c  = ggml_reshape_2d(ctx, mean_c,  C, B);
+    scale_c = ggml_reshape_2d(ctx, scale_c, C, B);
+    // normalize in [C, WH, B]
+    ggml_tensor * th = ggml_cont(ctx, ggml_permute(ctx,
+                           ggml_reshape_3d(ctx, x, WH, C, B), 1, 0, 2, 3));
+    ggml_tensor * y = ggml_sub(ctx, th, ggml_reshape_3d(ctx, mean_c,  C, 1, B));
+    y = ggml_mul(ctx, y, ggml_reshape_3d(ctx, scale_c, C, 1, B));
+    if (!affine_prefix.empty()) {
+        ggml_tensor * gw = get_t(m, affine_prefix + ".weight");
+        ggml_tensor * gb = get_t(m, affine_prefix + ".bias");
+        y = ggml_add(ctx, ggml_mul(ctx, y, ggml_reshape_3d(ctx, gw, C, 1, 1)),
+                          ggml_reshape_3d(ctx, gb, C, 1, 1));
+    }
+    y = ggml_reshape_4d(ctx, y, C, Hd, Wd, B);
+    return ggml_cont(ctx, ggml_permute(ctx, y, 2, 1, 0, 3));
+}
+static std::vector<ggml_tensor *> g_u_eps_inputs;
+
+// ── convs (same contract as vae.cpp) ─────────────────────────────────────
+ggml_tensor * conv(ggml_context * ctx, ggml_tensor * x, ggml_tensor * w,
+                   ggml_tensor * b, int stride, int pad) {
+    ggml_tensor * y = ggml_conv_2d(ctx, w, x, stride, stride, pad, pad, 1, 1);
+    if (b) {
+        b = ggml_reshape_4d(ctx, b, 1, 1, b->ne[0], 1);
+        y = ggml_add(ctx, y, b);
+    }
+    return y;
+}
+// F32-im2col conv (weights may still be f16 — mul_mat upcasts; the point is
+// the f32 window vectors). Same output layout as conv().
+ggml_tensor * conv_f32(ggml_context * ctx, ggml_tensor * x, ggml_tensor * w,
+                       ggml_tensor * b, int stride, int pad) {
+    ggml_tensor * im2col = ggml_im2col(ctx, w, x, stride, stride, pad, pad, 1, 1,
+                                       true, GGML_TYPE_F32);
+    ggml_tensor * wk = ggml_cast(ctx, w, GGML_TYPE_F32);
+    ggml_tensor * result = ggml_mul_mat(
+            ctx,
+            ggml_reshape_2d(ctx, im2col, im2col->ne[0],
+                            im2col->ne[3] * im2col->ne[2] * im2col->ne[1]),
+            ggml_reshape_2d(ctx, wk, wk->ne[0] * wk->ne[1] * wk->ne[2], wk->ne[3]));
+    result = ggml_reshape_4d(ctx, result, im2col->ne[1], im2col->ne[2],
+                             im2col->ne[3], w->ne[3]);
+    result = ggml_cont(ctx, ggml_permute(ctx, result, 0, 1, 3, 2));
+    if (b) {
+        b = ggml_reshape_4d(ctx, b, 1, 1, b->ne[0], 1);
+        result = ggml_add(ctx, result, b);
+    }
+    return result;
+}
+
+// torch NCHW bytes → [W,H,C,B] conv input (identity flat map, any B).
+ggml_tensor * to_conv(ggml_context * ctx, ggml_tensor * x) {
+    return x; // ne=[W,H,C,B] labeling only; bytes are already NCHW
+}
+// [W,H,C,B] → torch NCHW bytes (identity flat map).
+ggml_tensor * from_conv(ggml_context * ctx, ggml_tensor * x) {
+    return ggml_cont(ctx, x);
+}
+// [W,H,C,B] → torch-order [C,H,W,B] gather (attention flatten input).
+ggml_tensor * gather_chw(ggml_context * ctx, ggml_tensor * x) {
+    return ggml_cont(ctx, ggml_permute(ctx, x, 2, 1, 0, 3));
+}
+// [C,H,W,B] → [W,H,C,B] scatter back.
+ggml_tensor * scatter_whc(ggml_context * ctx, ggml_tensor * x) {
+    return ggml_cont(ctx, ggml_permute(ctx, x, 2, 1, 0, 3));
+}
+
+// LayerNorm over ne0 (= channel dim of [C,HW,B]) + affine (1-D weights).
+ggml_tensor * ln(ggml_context * ctx, ggml_tensor * x, ggml_tensor * w,
+                 ggml_tensor * b, float eps) {
+    ggml_tensor * n = ggml_norm(ctx, x, eps);
+    return ggml_add(ctx, ggml_mul(ctx, n, w), b);
+}
+
+// Multi-head attention over [C,HW,B] queries.
+//   kv: [C_kv, L_kv, B] torch-ordered source (itself for self-attn).
+//   per-head views + softmax; o written back via head-segments cat.
+ggml_tensor * attn_qkv(ggml_context * ctx, const UnetModel & m,
+                       ggml_tensor * h, ggml_tensor * kv,
+                       const std::string & p, int heads) {
+    const int64_t C   = h->ne[0];        // query channels
+    const int64_t HW  = h->ne[1];
+    const int64_t B   = h->ne[2];
+    const int64_t L   = kv->ne[1];       // key/value sequence length
+    const int64_t Ci  = get_t(m, p + "to_q.weight")->ne[1]; // inner = heads*hd
+    const int64_t hd  = Ci / heads;
+    const float scale = 1.0f / std::sqrt((float) hd);
+
+    ggml_tensor * q = ggml_mul_mat(ctx, get_t(m, p + "to_q.weight"), h);
+    ggml_tensor * k = ggml_mul_mat(ctx, get_t(m, p + "to_k.weight"), kv);
+    ggml_tensor * v = ggml_mul_mat(ctx, get_t(m, p + "to_v.weight"), kv);
+    // biases (q/k/v and out all have bias in SD weights)
+    if (has_t(m, p + "to_q.bias")) {
+        q = ggml_add(ctx, q, get_t(m, p + "to_q.bias"));
+        k = ggml_add(ctx, k, get_t(m, p + "to_k.bias"));
+        v = ggml_add(ctx, v, get_t(m, p + "to_v.bias"));
+    }
+    // head views: [Ci, N, B] → per-head [hd, N, B]
+    // att per head then cat along ne0 to rebuild [Ci, HW, B].
+    std::vector<ggml_tensor *> o_heads(heads);
+    for (int hi = 0; hi < heads; ++hi) {
+        ggml_tensor * qh = ggml_view_3d(ctx, q, hd, HW, B,
+                                        q->nb[1], q->nb[2], (size_t) hi * hd * sizeof(float));
+        ggml_tensor * kh = ggml_view_3d(ctx, k, hd, L, B,
+                                        k->nb[1], k->nb[2], (size_t) hi * hd * sizeof(float));
+        ggml_tensor * vh = ggml_view_3d(ctx, v, hd, L, B,
+                                        v->nb[1], v->nb[2], (size_t) hi * hd * sizeof(float));
+        // att[i,j] = softmax_i(q_j · k_i * scale)
+        ggml_tensor * att = ggml_scale(ctx, ggml_mul_mat(ctx, kh, qh), scale);
+        att = ggml_soft_max_ext(ctx, att, nullptr, 1.0f, 0.0f);   // [L, HW, B]
+        // o_h[j,c] = Σ_i att(i,j)·v(i,c): transpose v head to [L, hd, B]
+        ggml_tensor * vt = ggml_cont(ctx, ggml_permute(ctx, vh, 1, 0, 2, 3)); // [L, hd, B]
+        ggml_tensor * oh = ggml_mul_mat(ctx, att, vt);             // [HW, hd, B]
+        // back to [hd, HW, B] segment (c fastest within the head block)
+        o_heads[hi] = ggml_cont(ctx, ggml_permute(ctx, oh, 1, 0, 2, 3));
+    }
+    ggml_tensor * o = o_heads[0];
+    for (int hi = 1; hi < heads; ++hi) o = ggml_concat(ctx, o, o_heads[hi], 0);
+    o = ggml_cont(ctx, o); // cat inputs were views/conts — normalize
+    ggml_tensor * out = ggml_mul_mat(ctx, get_t(m, p + "to_out.0.weight"), o);
+    if (has_t(m, p + "to_out.0.bias")) out = ggml_add(ctx, out, get_t(m, p + "to_out.0.bias"));
+    return out; // [C, HW, B]
+}
+
+// BasicTransformerBlock on [C,HW,B]. ref: when non-null, attn1 uses
+// cat(h, ref) as its K/V source (RefOnly r-mode); when the string is "w",
+// the caller records h via the returned hook input (handled by caller).
+ggml_tensor * transformer_block(ggml_context * ctx, const UnetModel & m,
+                                ggml_tensor * h, ggml_tensor * context,
+                                const std::string & p, int heads,
+                                ggml_tensor * ref_in, ggml_tensor ** ref_out) {
+    // 1) self-attention (or RefOnly r cross-with-self). RefOnly 'w' stores
+    // exactly this post-LN input (ReferenceOnlyAttnProc wraps attn1).
+    h = ln(ctx, h, get_t(m, p + "norm1.weight"), get_t(m, p + "norm1.bias"),
+           m.hp.norm_eps);
+    if (ref_out) *ref_out = h;
+    ggml_tensor * kv = ref_in ? ggml_concat(ctx, h, ref_in, 1) : h;
+    ggml_tensor * a = attn_qkv(ctx, m, h, kv, p + "attn1.", heads);
+    h = ggml_add(ctx, h, a);
+    // 2) cross-attention on context
+    h = ln(ctx, h, get_t(m, p + "norm2.weight"), get_t(m, p + "norm2.bias"),
+           m.hp.norm_eps);
+    a = attn_qkv(ctx, m, h, context, p + "attn2.", heads);
+    h = ggml_add(ctx, h, a);
+    // 3) GEGLU feed-forward
+    h = ln(ctx, h, get_t(m, p + "norm3.weight"), get_t(m, p + "norm3.bias"),
+           m.hp.norm_eps);
+    {
+        ggml_tensor * g = ggml_mul_mat(ctx, get_t(m, p + "ff.net.0.proj.weight"), h); // [2I, HW, B]
+        const int64_t I = g->ne[0] / 2;
+        ggml_tensor * u = ggml_view_3d(ctx, g, I, g->ne[1], g->ne[2],
+                                       g->nb[1], g->nb[2], 0);
+        ggml_tensor * gate = ggml_view_3d(ctx, g, I, g->ne[1], g->ne[2],
+                                          g->nb[1], g->nb[2], I * sizeof(float));
+        gate = ggml_gelu(ctx, gate);
+        ggml_tensor * ff = ggml_mul(ctx, u, gate);
+        ff = ggml_mul_mat(ctx, get_t(m, p + "ff.net.2.weight"), ff);
+        h = ggml_add(ctx, h, ff);
+    }
+    return h;
+}
+
+// Transformer2DModel: GN → proj_in → block(s) → proj_out, residual outside.
+ggml_tensor * transformer(ggml_context * ctx, const UnetModel & m,
+                          ggml_tensor * x, ggml_tensor * context,
+                          const std::string & p, int heads,
+                          ggml_tensor * ref_in, ggml_tensor ** ref_out) {
+    const int64_t C  = x->ne[2];
+    const int64_t HW = x->ne[0] * x->ne[1];
+    const int64_t B  = x->ne[3];
+    ggml_tensor * g = ggml_group_norm(ctx, x, m.hp.norm_num_groups, m.hp.norm_eps);
+    {
+        ggml_tensor * gw = get_t(m, p + "norm.weight");
+        ggml_tensor * gb = get_t(m, p + "norm.bias");
+        gw = ggml_reshape_4d(ctx, gw, 1, 1, gw->ne[0], 1);
+        gb = ggml_reshape_4d(ctx, gb, 1, 1, gb->ne[0], 1);
+        g = ggml_add(ctx, ggml_mul(ctx, g, gw), gb);
+    }
+    u_mark(ctx, g, p + "tgn");
+    ggml_tensor * h = gather_chw(ctx, g);                    // [C, HW, B] torch
+    h = ggml_reshape_3d(ctx, h, C, HW, B);
+    u_mark(ctx, h, p + "tgather");
+    h = ggml_mul_mat(ctx, get_t(m, p + "proj_in.weight"), h);  // linear proj (with bias)
+    if (has_t(m, p + "proj_in.bias")) h = ggml_add(ctx, h, get_t(m, p + "proj_in.bias"));
+    u_mark(ctx, h, p + "tproj");
+    h = transformer_block(ctx, m, h, context, p + "transformer_blocks.0.", heads,
+                          ref_in, ref_out);
+    h = ggml_mul_mat(ctx, get_t(m, p + "proj_out.weight"), h);
+    if (has_t(m, p + "proj_out.bias")) h = ggml_add(ctx, h, get_t(m, p + "proj_out.bias"));
+    h = ggml_reshape_4d(ctx, h, C, x->ne[1], x->ne[0], B);   // [C,H,W,B]
+    h = scatter_whc(ctx, h);                                 // [W,H,C,B]
+    return ggml_add(ctx, x, h);
+}
+
+// ResnetBlock2D with time-emb. ch_out read from conv1 weights.
+ggml_tensor * resnet(ggml_context * ctx, const UnetModel & m, ggml_tensor * x,
+                     ggml_tensor * temb_col, const std::string & p) {
+    u_mark(ctx, x, p + "x_in");
+    if (std::getenv("IM_VAE_TRACE"))
+        std::fprintf(stderr, "GN %s x=[%lld %lld %lld %lld] nb=[%lld %lld %lld %lld] groups=%d eps=%g\n",
+            p.c_str(), (long long)x->ne[0], (long long)x->ne[1], (long long)x->ne[2], (long long)x->ne[3],
+            (long long)(x->nb[0]/4), (long long)(x->nb[1]/4), (long long)(x->nb[2]/4), (long long)(x->nb[3]/4),
+            m.hp.norm_num_groups, m.hp.norm_eps);
+    ggml_tensor * h = ggml_group_norm(ctx, x, m.hp.norm_num_groups, m.hp.norm_eps);
+    {
+        ggml_tensor * gw = get_t(m, p + "norm1.weight");
+        ggml_tensor * gb = get_t(m, p + "norm1.bias");
+        gw = ggml_reshape_4d(ctx, gw, 1, 1, gw->ne[0], 1);
+        gb = ggml_reshape_4d(ctx, gb, 1, 1, gb->ne[0], 1);
+        h = ggml_add(ctx, ggml_mul(ctx, h, gw), gb);
+    }
+    u_mark(ctx, h, p + "norm1");
+    h = ggml_silu(ctx, h);
+    u_mark(ctx, h, p + "silu1");
+    h = conv(ctx, h, get_t(m, p + "conv1.weight"), get_t(m, p + "conv1.bias"), 1, 1);
+    u_mark(ctx, h, p + "conv1");
+    // temb: silu → linear → [:,:,None,None]; temb_col is [1280, B]
+    ggml_tensor * te = ggml_silu(ctx, temb_col);
+    te = ggml_mul_mat(ctx, get_t(m, p + "time_emb_proj.weight"), te); // [C, B]
+    const int64_t C = te->ne[0], B = te->ne[1];
+    te = ggml_reshape_4d(ctx, te, 1, 1, C, B);                        // broadcast view
+    if (has_t(m, p + "time_emb_proj.bias")) {
+        ggml_tensor * tb = ggml_reshape_4d(ctx, get_t(m, p + "time_emb_proj.bias"), 1, 1, C, 1);
+        te = ggml_add(ctx, te, tb);                                   // ne3 broadcasts
+    }
+    h = ggml_add(ctx, h, te);
+    u_mark(ctx, h, p + "conv1_te");
+    u_mark(ctx, te, p + "te");
+    ggml_tensor * hn = ggml_group_norm(ctx, h, m.hp.norm_num_groups, m.hp.norm_eps);
+    u_mark(ctx, hn, p + "gn2_bare");
+    if (g_u_dump) g_u_gn2_dump.push_back({h, hn, p});
+    {
+        ggml_tensor * gw = get_t(m, p + "norm2.weight");
+        ggml_tensor * gb = get_t(m, p + "norm2.bias");
+        gw = ggml_reshape_4d(ctx, gw, 1, 1, gw->ne[0], 1);
+        gb = ggml_reshape_4d(ctx, gb, 1, 1, gb->ne[0], 1);
+        h = ggml_add(ctx, ggml_mul(ctx, hn, gw), gb);
+    }
+    u_mark(ctx, h, p + "norm2");
+    h = ggml_silu(ctx, h);
+    h = conv(ctx, h, get_t(m, p + "conv2.weight"), get_t(m, p + "conv2.bias"), 1, 1);
+    u_mark(ctx, h, p + "conv2");
+    const std::string sc = p + "conv_shortcut.weight";
+    if (has_t(m, sc)) {
+        x = conv(ctx, x, get_t(m, sc),
+                 get_t(m, p + "conv_shortcut.bias"), 1, 0);
+    }
+    return ggml_add(ctx, h, x);
+}
+
+// sinusoidal timestep embedding → [320, B] column-shared
+// sinusoidal timestep embedding → [320, B] column-shared. The [320] vector
+// (cos|sin — flip_sin_to_cos) is computed on the HOST and returned as an
+// input tensor for the caller to fill after gallocr allocation.
+ggml_tensor * time_embedding(ggml_context * ctx, const UnetModel & m,
+                             float t, int B, ggml_tensor ** emb_in) {
+    std::vector<float> e(320); // flip_sin_to_cos: [cos, sin]
+    {
+        const int half = 320 / 2;
+        std::vector<float> f(half);
+        for (int i = 0; i < half; ++i)
+            f[i] = std::exp(-(float) std::log(10000.0) * (float) i /
+                            (float) (half - m.hp.freq_shift));
+        for (int i = 0; i < half; ++i) {
+            e[i]        = std::cos(t * f[i]);
+            e[half + i] = std::sin(t * f[i]);
+        }
+    }
+    ggml_tensor * emb0 = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 320);
+    ggml_set_input(emb0);
+    *emb_in = emb0;
+    ggml_tensor * emb = ggml_reshape_2d(ctx, emb0, 320, 1);
+    emb = ggml_repeat(ctx, emb, ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 320, B));
+    ggml_tensor * te = ggml_mul_mat(ctx, get_t(m, "time_embedding.linear_1.weight"), emb);
+    te = ggml_add(ctx, te, get_t(m, "time_embedding.linear_1.bias"));
+    te = ggml_silu(ctx, te);
+    te = ggml_mul_mat(ctx, get_t(m, "time_embedding.linear_2.weight"), te);
+    te = ggml_add(ctx, te, get_t(m, "time_embedding.linear_2.bias"));
+    return te;                                                        // [1280, B]
+}
+
+} // namespace
+
+bool unet_load(const std::string & path, ggml_backend_t backend,
+               UnetModel & out, std::string * error) {
+    if (!load_gguf(path, backend, out.gguf, error)) return false;
+    out.backend = backend;
+    const gguf_context * g = out.gguf.gguf;
+    out.hp.in_channels  = kv_i32(g, "unet.in_channels", 4);
+    out.hp.out_channels = kv_i32(g, "unet.out_channels", 4);
+    out.hp.layers_per_block = kv_i32(g, "unet.layers_per_block", 2);
+    out.hp.cross_attention_dim = kv_i32(g, "unet.cross_attention_dim", 1024);
+    out.hp.norm_num_groups = kv_i32(g, "unet.norm_num_groups", 32);
+    out.hp.norm_eps = kv_f32(g, "unet.norm_eps", 1e-5f);
+    out.hp.use_linear_projection = kv_bool(g, "unet.use_linear_projection", true);
+    out.hp.flip_sin_to_cos = kv_bool(g, "unet.flip_sin_to_cos", true);
+    out.hp.freq_shift = kv_i32(g, "unet.freq_shift", 0);
+    const char * boc = kv_str(g, "unet.block_out_channels", "320,640,1280,1280");
+    std::sscanf(boc, "%d,%d,%d,%d", &out.hp.block_out_channels[0],
+                &out.hp.block_out_channels[1], &out.hp.block_out_channels[2],
+                &out.hp.block_out_channels[3]);
+    const char * ahd = kv_str(g, "unet.attention_head_dim", "5,10,20,20");
+    std::sscanf(ahd, "%d,%d,%d,%d", &out.hp.num_heads[0],
+                &out.hp.num_heads[1], &out.hp.num_heads[2],
+                &out.hp.num_heads[3]);
+    return true;
+}
+
+float * unet_forward_refonly(const UnetModel & m,
+                             const float * sample, const float * ref_sample,
+                             const float * context, int context_len,
+                             int B, int H, int W, float timestep,
+                             int * out_h, int * out_w) {
+    ggml_init_params ip = { (size_t) 8 << 30, nullptr, true };
+    ggml_context * ctx = ggml_init(ip);
+    const auto & hp = m.hp;
+    const int L = context_len;
+
+    // inputs (torch NCHW bytes / [B,L,1024])
+    ggml_tensor * sample_t   = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, W, H, hp.in_channels, B);
+    ggml_tensor * ref_t      = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, W, H, hp.in_channels, B);
+    ggml_tensor * context_t  = ggml_new_tensor_3d(ctx, GGML_TYPE_F32,
+                                                  hp.cross_attention_dim, L, B);
+    std::vector<ggml_tensor *> dumps;   // staged parity points
+    std::vector<std::string> dump_nm;
+    const bool dump = std::getenv("IM_VAE_DUMP") != nullptr;
+    g_u_dump = dump;
+    // graph first: dumps expand themselves as the passes are built
+    g_u_gf = ggml_new_graph_custom(ctx, 65536, false);
+    ggml_cgraph * gf = g_u_gf;
+    ggml_tensor * emb_in = nullptr;
+    ggml_tensor * temb = time_embedding(ctx, m, timestep, B, &emb_in); // [1280, B]
+    u_mark(ctx, temb, "temb");
+    auto dmark = [&](ggml_tensor * t, const char * nm) {
+        if (dump) {
+            ggml_tensor * d = ggml_cont(ctx, t);
+            dumps.push_back(d); dump_nm.push_back(nm);
+            ggml_build_forward_expand(gf, d);
+        }
+    };
+
+    // ── shared pass builder. `ref` maps each attn1 name to its w-pass input
+    // (null during the w-pass itself).
+    ggml_tensor * ref_store[16] = {}; // down 2x3 + mid 1 + up 3x3
+    auto build_pass = [&](ggml_tensor * x_in, bool is_w) {
+        g_u_pass = is_w ? "w" : "r";
+        std::vector<ggml_tensor *> skips;
+        ggml_tensor * cur = conv_f32(ctx, to_conv(ctx, x_in),
+                                     get_t(m, "conv_in.weight"), get_t(m, "conv_in.bias"), 1, 1);
+        if (is_w) dmark(cur, "w.conv_in");
+        skips.push_back(cur);
+        // ── down ──
+        for (int lvl = 0; lvl < 4; ++lvl) {
+            const std::string bp = "down_blocks." + std::to_string(lvl) + ".";
+            for (int j = 0; j < hp.layers_per_block; ++j) {
+                // CrossAttnDownBlock2D: resnet then transformer, per layer
+                cur = resnet(ctx, m, cur, temb, bp + "resnets." + std::to_string(j) + ".");
+                skips.push_back(cur);
+                if (is_w) dmark(cur, ("w.d" + std::to_string(lvl) + ".r" + std::to_string(j)).c_str());
+                if (lvl < 3) {
+                    const int ridx = lvl * hp.layers_per_block + j;
+                    cur = transformer(ctx, m, cur, context_t,
+                                      bp + "attentions." + std::to_string(j) + ".",
+                                      hp.num_heads[lvl],
+                                      is_w ? nullptr : ref_store[ridx],
+                                      is_w ? &ref_store[ridx] : nullptr);
+                    if (is_w) {
+                        dmark(cur, ("w.d" + std::to_string(lvl) + ".attn" + std::to_string(j)).c_str());
+                        u_mark(ctx, ref_store[ridx], "refstore" + std::to_string(ridx));
+                    }
+                }
+            }
+            if (lvl < 3) {
+                // symmetric stride-2 pad-1 downsample (downsample_padding=1)
+                cur = conv_f32(ctx, cur, get_t(m, bp + "downsamplers.0.conv.weight"),
+                               get_t(m, bp + "downsamplers.0.conv.bias"), 2, 1);
+                skips.push_back(cur);
+            }
+        }
+        // ── mid ──
+        cur = resnet(ctx, m, cur, temb, "mid_block.resnets.0.");
+        cur = transformer(ctx, m, cur, context_t, "mid_block.attentions.0.",
+                          hp.num_heads[3], is_w ? nullptr : ref_store[6],
+                          is_w ? &ref_store[6] : nullptr);
+        if (is_w) u_mark(ctx, ref_store[6], "refstore6");
+        cur = resnet(ctx, m, cur, temb, "mid_block.resnets.1.");
+        if (is_w) dmark(cur, "w.mid");
+        // ── up ──
+        for (int lvl = 0; lvl < 4; ++lvl) {
+            const std::string bp = "up_blocks." + std::to_string(lvl) + ".";
+            const bool has_attn = lvl > 0; // UpBlock2D, CrossAttnUpBlock2D×3
+            for (int j = 0; j < hp.layers_per_block + 1; ++j) {
+                const std::string rp = bp + "resnets." + std::to_string(j) + ".";
+                ggml_tensor * skip = skips.back(); skips.pop_back();
+                cur = ggml_concat(ctx, cur, skip, 2); // channel cat on ne2
+                cur = resnet(ctx, m, cur, temb, rp);
+                if (has_attn) {
+                    const int heads = hp.num_heads[3 - lvl];
+                    const int ridx = 7 + (lvl - 1) * 3 + j; // up1..3, j0..2
+                    cur = transformer(ctx, m, cur, context_t,
+                                      bp + "attentions." + std::to_string(j) + ".",
+                                      heads,
+                                      is_w ? nullptr : ref_store[ridx],
+                                      is_w ? &ref_store[ridx] : nullptr);
+                }
+            }
+            if (lvl < 3) {
+                cur = ggml_upscale(ctx, cur, 2, GGML_SCALE_MODE_NEAREST);
+                cur = conv_f32(ctx, cur, get_t(m, bp + "upsamplers.0.conv.weight"),
+                               get_t(m, bp + "upsamplers.0.conv.bias"), 1, 1);
+            }
+        }
+        cur = ggml_group_norm(ctx, cur, hp.norm_num_groups, hp.norm_eps);
+        {
+            ggml_tensor * gw = get_t(m, "conv_norm_out.weight");
+            ggml_tensor * gb = get_t(m, "conv_norm_out.bias");
+            gw = ggml_reshape_4d(ctx, gw, 1, 1, gw->ne[0], 1);
+            gb = ggml_reshape_4d(ctx, gb, 1, 1, gb->ne[0], 1);
+            cur = ggml_add(ctx, ggml_mul(ctx, cur, gw), gb);
+        }
+        cur = ggml_silu(ctx, cur);
+        return conv_f32(ctx, cur, get_t(m, "conv_out.weight"),
+                        get_t(m, "conv_out.bias"), 1, 1);
+    };
+
+    ggml_tensor * w_out = build_pass(ref_t, /*is_w=*/true);   // ref_vec filled
+    ggml_tensor * r_out = build_pass(sample_t, /*is_w=*/false);
+
+    ggml_tensor * result_t = ggml_cont(ctx, r_out);
+    ggml_set_output(result_t);
+    for (size_t i = 0; i < dumps.size(); ++i) ggml_set_output(dumps[i]);
+    for (size_t i = 0; i < g_u_dump_t.size(); ++i) ggml_set_output(g_u_dump_t[i]);
+
+    ggml_gallocr_t alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(m.backend));
+    // per-head attention explodes the node count — size generously
+    ggml_build_forward_expand(gf, w_out);     // tail of the w chain
+    ggml_build_forward_expand(gf, result_t);  // tail of the r chain
+    ggml_gallocr_alloc_graph(alloc, gf);
+    {
+        std::vector<float> ev(320);
+        const int half = 160;
+        for (int i = 0; i < half; ++i)
+            ev[i] = std::exp(-(float) std::log(10000.0) * (float) i /
+                             (float) (half - m.hp.freq_shift));
+        std::vector<float> e(320);
+        for (int i = 0; i < half; ++i) {
+            e[i]        = std::cos(timestep * ev[i]);
+            e[half + i] = std::sin(timestep * ev[i]);
+        }
+        ggml_backend_tensor_set(emb_in, e.data(), 0, e.size() * sizeof(float));
+    }
+    {
+        std::vector<float> one(65536, 1.0f); // max WH; slice per tensor
+        for (auto * t : g_u_fill_ones_wh) {
+            ggml_backend_tensor_set(t, one.data(), 0, t->ne[0] * sizeof(float));
+        }
+        for (auto * t : g_u_fill_ones_cpg) {
+            ggml_backend_tensor_set(t, one.data(), 0, t->ne[0] * sizeof(float));
+        }
+        std::vector<float> epsv((size_t) m.hp.norm_num_groups * B, m.hp.norm_eps);
+        for (auto * t : g_u_fill_eps) {
+            ggml_backend_tensor_set(t, epsv.data(), 0, epsv.size() * sizeof(float));
+        }
+        for (auto * t : g_u_fill_ones_gb) {
+            ggml_backend_tensor_set(t, one.data(), 0, t->ne[0] * sizeof(float));
+        }
+    }
+    ggml_backend_tensor_set(sample_t, sample, 0,
+                            (size_t) B * hp.in_channels * H * W * sizeof(float));
+    ggml_backend_tensor_set(ref_t, ref_sample, 0,
+                            (size_t) B * hp.in_channels * H * W * sizeof(float));
+    ggml_backend_tensor_set(context_t, context, 0,
+                            (size_t) B * hp.cross_attention_dim * L * sizeof(float));
+    ggml_backend_graph_compute(m.backend, gf);
+    for (size_t i = 0; i < dumps.size(); ++i) {
+        const size_t n = ggml_nelements(dumps[i]);
+        std::vector<float> buf(n);
+        ggml_backend_tensor_get(dumps[i], buf.data(), 0, n * sizeof(float));
+        char fn[128]; std::snprintf(fn, sizeof(fn), "/tmp/unet_%s.bin", dump_nm[i].c_str());
+        FILE * f = std::fopen(fn, "wb"); std::fwrite(buf.data(), 4, n, f); std::fclose(f);
+    }
+    for (size_t i = 0; i < g_u_dump_t.size(); ++i) {
+        const size_t n = ggml_nelements(g_u_dump_t[i]);
+        std::vector<float> buf(n);
+        ggml_backend_tensor_get(g_u_dump_t[i], buf.data(), 0, n * sizeof(float));
+        char fn[160]; std::snprintf(fn, sizeof(fn), "/tmp/unet_%s.bin", g_u_dump_nm[i].c_str());
+        FILE * f = std::fopen(fn, "wb"); std::fwrite(buf.data(), 4, n, f); std::fclose(f);
+    }
+    g_u_dump_t.clear(); g_u_dump_nm.clear();
+    for (auto & [src, dst, nm] : g_u_gn2_dump) {
+        std::vector<float> sv(std::min<size_t>(ggml_nelements(src), 8));
+        std::vector<float> dv(std::min<size_t>(ggml_nelements(dst), 8));
+        ggml_backend_tensor_get(src, sv.data(), 0, sv.size() * 4);
+        ggml_backend_tensor_get(dst, dv.data(), 0, dv.size() * 4);
+        std::fprintf(stderr, "GN2 %s src[0..3]=%g,%g,%g,%g dst[0..3]=%g,%g,%g,%g sameBuf=%d\n",
+            nm.c_str(), sv[0], sv[1], sv[2], sv[3], dv[0], dv[1], dv[2], dv[3],
+            (int)(src->data == dst->data));
+    }
+    g_u_gn2_dump.clear();
+    float * result = (float *) malloc((size_t) B * hp.out_channels * H * W * sizeof(float));
+    ggml_backend_tensor_get(result_t, result, 0,
+                            (size_t) B * hp.out_channels * H * W * sizeof(float));
+    ggml_gallocr_free(alloc);
+    ggml_free(ctx);
+    if (out_h) *out_h = H;
+    if (out_w) *out_w = W;
+    return result;
+}
+
+} // namespace instantmesh
