@@ -11,7 +11,7 @@ endif()
 
 # ─────────────────────────────────────────────────────────────────────────
 # Backend selection. ggml is vendored at third_party/ggml (submodule,
-# upstream v0.18.1 + patches/*.patch, currently the RMBG custom ops).
+# upstream v0.21.0 + patches/*.patch, currently the RMBG custom ops).
 # CUDA and
 # Vulkan are *build-time* options of ggml; the inference code below is backend
 # agnostic — at runtime it queries the ggml backend registry and picks the first
@@ -123,6 +123,10 @@ target_link_libraries(synthesizer PRIVATE instantmesh_core)
 
 add_executable(flexicubes src/tools/flexicubes.cpp)
 target_link_libraries(flexicubes PRIVATE instantmesh_core)
+
+add_executable(zero123pp src/tools/zero123pp.cpp)
+target_link_libraries(zero123pp PRIVATE instantmesh_core)
+target_include_directories(zero123pp PRIVATE src/utils)
 
 # ─────────────────────────────────────────────────────────────────────────
 # RMBG-2.0 (BiRefNet) background removal, vendored at

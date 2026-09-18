@@ -79,7 +79,7 @@ int main(int argc, char ** argv) {
         }
         std::memcpy(cond.data(), blob.data(), cond.size() * sizeof(float));
     } else {
-        for (size_t i = 0; i < cond.size(); ++i) cond[i] = ((i % 10) - 5) * 0.05f;
+        for (size_t i = 0; i < cond.size(); ++i) cond[i] = ((float) (i % 10) - 5.0f) * 0.05f;
     }
 
     int planes = 0, dim = 0, out_h = 0, out_w = 0;

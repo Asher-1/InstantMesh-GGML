@@ -368,13 +368,16 @@ Completed (in this repo):
   fp16 re-rounding from upstream kernel retuning; the f16 recommendation in the
   model card is unaffected.
 
-### Not Done / TODO
+### Status / TODO
 
-- ❌ **Zero123++ multi-view diffusion + VAE + scheduler** (single image → 6 views) not
-  ported yet; current inputs are preprocessed by
-  [convert/gen_multiview.py](../cpp_ggml/convert/gen_multiview.py)/[convert/prep_input.py](../cpp_ggml/convert/prep_input.py)
-  (not real Zero123++ generation, which limits reconstruction quality).
-- ❌ **rembg(BiRefNet) foreground segmentation** not integrated yet.
+- ✅ **Zero123++ multi-view diffusion + VAE + scheduler** ported and parity-verified:
+  [src/tools/zero123pp.cpp](../cpp_ggml/src/tools/zero123pp.cpp) chains CLIP vision →
+  scheduler → UNet → VAE decode; per-component parity via ctest fixtures
+  (`test_clip_vision`, `test_scheduler`, `test_unet`, `test_vae`) all pass
+  (UNet f32/f16 max_abs≈7e-4/8.8e-4, VAE encode 2.4e-4 / decode 3e-3).
+- ✅ **rembg(BiRefNet) foreground segmentation** integrated via ggml custom ops
+  (see `ggml-rmbg-ops.patch`) with the `rembg` tool; not yet chain-integrated into
+  the single-command instantmesh pipeline.
 - ❌ **NeuralRender rendering** (ray-marching) not ported yet.
 - ❌ **GLB packaging export** not implemented (texture baking is implemented, outputs
   OBJ+MTL+PNG).

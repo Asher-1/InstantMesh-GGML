@@ -108,7 +108,7 @@ int main(int argc, char ** argv) {
         }
         std::memcpy(planes.data(), blob.data(), planes.size() * sizeof(float));
     } else {
-        for (size_t i = 0; i < planes.size(); ++i) planes[i] = ((i % 10) - 5) * 0.05f;
+        for (size_t i = 0; i < planes.size(); ++i) planes[i] = ((float) (i % 10) - 5.0f) * 0.05f;
     }
 
     float * sdf = nullptr, * deformation = nullptr, * weight = nullptr, * rgb = nullptr;

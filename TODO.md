@@ -2,7 +2,7 @@
 
 > C++ ↔ 官方 Python 功能对齐现状、阻塞原因与下一步行动
 >
-> 生成时间：2026-09-07 · 更新：2026-09-08（VAE 收敛 ✅，布局契约定案）
+> 生成时间：2026-09-07 · 更新：2026-09-17（UNet/Pipeline ✅，Vulkan 全精度回归进行中）
 
 ---
 
@@ -14,18 +14,19 @@
 | 2 | Zero123++ CLIPVision | ✅ 完成 | `test_clip_vision` Passed（7.6e-6） |
 | 3 | Zero123++ 权重转换链 | ✅ 完成（3 份 GGUF 已产出） | — |
 | 4 | Zero123++ VAE encode/decode | ✅ 完成（encode 2.4e-4 / decode 3.0e-3） | `test_vae` Passed（无门控） |
-| 5 | UNet + RefOnly attention | ❌ 未开始（布局契约已就绪） | 无 |
-| 6 | Denoising pipeline / zero123pp CLI | ❌ 未开始（被 5 阻塞） | 无 |
+| 5 | UNet + RefOnly attention | ✅ 完成（f32 7.1e-4 / f16 8.8e-4） | `test_unet` Passed |
+| 6 | Denoising pipeline / zero123pp CLI | 🔨 已组装（`src/tools/zero123pp.cpp`），E2E PSNR 验收待做 | 无（`--fixture-dir` 已支持） |
 | 7 | rembg | ✅ 完成 | 实测 blue_cat 跑通 |
 | 8 | NeRF 变体 + NeuralRender | ❌ 未开始 | 无 |
 | 9 | `--save_video` | ❌ 未开始 | 无 |
 | 10 | `--export_texmap` 烘焙 | ✅ 已对齐（xatlas UV + 多视角烘焙） | `test_texture_map` Passed |
 | 11 | PBR 纹理 | ➖ N/A（官方 InstantMesh 代码中不存在 PBR 通路，无需对齐） | — |
 | 12 | ggml 布局契约回归探针 | ✅ 完成 | `test_conv_layout` Passed |
+| 13 | Vulkan 全精度逐层回归 | 🔨 进行中（首轮已跑：见 §7） | 测试增加设备覆盖后 cuda/vulkan 分跑 |
 
 ---
 
-## 1. Zero123++ Pipeline — VAE 已收敛，剩 UNet + 组装
+## 1. Zero123++ Pipeline — UNet/组装已收敛，剩 E2E 验收
 
 ### 已完成部分
 
@@ -42,17 +43,18 @@
 4. **非对称下采样**：diffusers Downsample2D（`ds.padding=0`）= 先 `F.pad(x,(0,1,0,1))` 右下零填充，再 stride-2 **padding-0** conv；`ggml_pad` 参数是 ne 后缀填充量，应为 `(1,1,0,0)`。
 5. **f16 im2col 地板**：`ggml_conv_2d` 硬编码 f16 im2col（~f16 eps/conv，深链累积到 1e-1）。encode 改用 `conv_f32()`（手动 im2col F32 + mul_mat，内存×2）压回 2.4e-4；decode 维持 f16（已达标）。
 
-### 下一步（沿布局契约直接铺 UNet）
+### 下一步（E2E 验收）
 
-1. **UNet(RefOnly)**：time-emb MLP（sinusoidal+linear）、ResBlock（GN/SiLU/conv+skip，GN affine 走 `[1,1,C,1]`）、self+cross attention（cross_attention_dim=1024、use_linear_projection=true、heads 8×head_dim 40）、down/mid/up 结构；**RefOnly**：w-forward 收集各层 self-attn K/V → ref_dict，r-forward 拼接（零初始化权重，仅 cat）；`ramping_coefficients[65]` 逐 step 缩放。复用 `conv_f32` 与 staged-dump 方法论（`convert/dump_vae_stages.py` + `compare_vae_stages.py` 模式）。
-2. **pipeline 组装** → `zero123pp` e2e PSNR 验收。
+1. **UNet(RefOnly)** ✅（2026-09-16 收敛）：time-emb MLP、ResBlock（GN/SiLU/conv+skip）、self+cross attention（cross_attention_dim=1024、use_linear_projection=true、heads 8×head_dim 40）、down/mid/up + RefOnly w/r 双前向 + ramping 缩放；f32 7.1e-4 / f16 8.8e-4（合成 fixture，torch 逐层参照）。
+2. **pipeline 组装** ✅：`src/tools/zero123pp.cpp`（rembg→VAE encode(cond)→CLIPVision→75 步双前向→cfg 4.0→VAE decode→3×2 网格），已支持 `--fixture-dir`（回放官方同 seed 噪声）/`--dump-final-latents`/`--dump-steps`。
+3. **E2E PSNR 验收**（当前）：用 `convert/dump_e2e.py` 产出官方逐 step fixture（r/w input、eps、latents、context、噪声），C++ `--fixture-dir` 回放 → 对比 `ref_latents.bin` 与 6 视图 PSNR；方案见 `docs/ALIGNMENT.md` 验收标准。
 
 ---
 
-## 2. Denoising Pipeline / zero123pp CLI — 未开始（被 UNet 阻塞）
+## 2. Denoising Pipeline / zero123pp CLI — 已组装，待 E2E PSNR 验收
 
-- **状态**：官方信息流已在 `docs/ALIGNMENT.md` 完整记录。
-- **下一步**：组装 `rembg → VAE encode(cond) → CLIPVision → 75 步双前向(RefOnly) → cfg 4.0 → VAE decode → unscale → 3×2 网格切分 6 视图`；`VaeImageProcessor.postprocess` 后处理为 host C++ 纯数值；验收标准为同 seed 与 PyTorch PSNR 达标。
+- **状态**：官方信息流已在 `docs/ALIGNMENT.md` 完整记录；`src/tools/zero123pp.cpp` 已实现 `rembg → VAE encode(cond) → CLIPVision → 75 步双前向(RefOnly) → cfg 4.0 → VAE decode → unscale → 3×2 网格切分 6 视图`。
+- **下一步**：`convert/dump_e2e.py` 生成官方同 seed fixture → `zero123pp --fixture-dir ... --dump-final-latents` 回放 → 逐 step/最终 latents 与 6 视图 PSNR 验收（验收标准已列）。
 
 ---
 
@@ -92,9 +94,34 @@
 ## 建议执行顺序
 
 1. ~~VAE 数值收敛~~ ✅（2026-09-08，见 §1 实录）；
-2. **UNet(RefOnly)**（直接复用 §1 布局契约 + conv_f32 + staged-dump 方法论）→ **pipeline 组装** → `zero123pp` e2e PSNR 验收；
-3. 并行支线：NeRF 变体转换 + ray marcher；`--save_video` 光栅化器；
-4. 最终 e2e：`instantmesh --image x.png --rmbg rmbg.gguf` 与 `python run.py` 同输入同输出对齐（验收标准已写入 `docs/ALIGNMENT.md`）。
+2. ~~UNet(RefOnly) + pipeline 组装~~ ✅（2026-09-16/17）→ 进行中：`zero123pp` e2e PSNR 验收（`dump_e2e.py` + `--fixture-dir`）；
+3. **Vulkan 全精度逐层回归**（进行中）：GPU 双后端构建 + ctest cuda/vulkan 分跑 + staged-dump 逐层对比；
+4. 并行支线：NeRF 变体转换 + ray marcher；`--save_video` 光栅化器；
+5. 最终 e2e：`instantmesh --image x.png --rmbg rmbg.gguf` 与 `python run.py` 同输入同输出对齐（验收标准已写入 `docs/ALIGNMENT.md`）。
+
+---
+
+## 7. Vulkan 全精度逐层回归（2026-09-17 首轮）
+
+- **基础设施**：`backend.cpp` 支持显式设备名（`cuda`/`vulkan` 前缀匹配）；`test_unet/vae/clip_vision` 增加 argv[1] 设备参数（默认 cpu）；`build-gpu`（CUDA+Vulkan 双后端）构建脚本见 `cpp_ggml/README.md` §3 Route C。本机多 CUDA 共存（11.1/11.4/11.8）导致 exe 链接时 libcudart 版本歧义，需 `CMAKE_EXE_LINKER_FLAGS` 显式指向 11.8（仅本机）。
+- **修复的 bug**：UNet GEGLU 把非连续 view 传给 `ggml_gelu` → CUDA `unary.cu` 断言 `ggml_is_contiguous` 失败（CPU/Vulkan 容忍）；已加 `ggml_cont`，CUDA UNet 由崩溃 → 9.4e-4 PASS。
+- **数值矩阵（vs torch fixture，f32 权重路径）**：
+
+  | 组件 | CPU | CUDA | CUDA(TF32 off) | Vulkan |
+  |---|---|---|---|---|
+  | CLIPVision | 7.6e-6 ✅ | 1.5e-3 ❌ | 1.2e-5 ✅ | 1.5e-3 ❌ |
+  | VAE encode | 2.4e-4 ✅ | 6.0e-2 ❌ | 1.45e-2 ❌ | 1.17e-1 ❌ |
+  | VAE decode | 3.0e-3 ✅ | 3.5e-3 ✅ | 3.1e-3 ✅ | 1.7e-2 ❌ |
+  | UNet(refonly) | 7.1e-4 ✅ | 崩溃→修复 | 9.4e-4 ✅ | 2.5e-2 ✅(0.35) |
+
+- **VAE encoder staged-dump（CUDA vs Vulkan 逐层 max_abs）**：conv_in_raw 1.4e-4 → rs_conv1 4.3e-3 → down0 4.4e-3 → down1 5.4e-2 → down2 4.1e-1 → mid1 1.76。k_in 0 差。结论：**单调累积的 f32 重排误差（re-rounding），非语义/布局差异**。
+- **CLIP staged-dump（CUDA vs Vulkan 逐层 max_abs）**：patch/emb 5.2e-5 → layer0 8.5e-4 → layer1 1.2e-3 → last 3.0e-2 → post_ln 6.2e-2。与 VAE 同模式：24 层单调累积（软max/attention 放大），非语义差异；1024 维投影后（token 平均）误差回到 ~1e-3 量级（vs torch：cuda 1.2e-5 / vulkan 1.5e-3）。
+- **CLIP layer0 内部（IM_CV_L0，CUDA vs Vulkan max_abs）**：ln1 4.1e-4（均值 2.9e-7）→ q/k/v 3.5-5.2e-4 → **attn_raw 1.3e-3（首个/最大放大点，softmax attention 路径）** → attn_proj 3.6e-4（大 matmul 平均后回落）。**排除 convs fp16 dot 假设**：CLIP 无 conv（patch embed 走手动 f32 im2col+mul_mat，见 clip_vision.cpp 注释），编码器全为 F32 fma matmul。
+- **fp16 dot 路径的真实位置**：ggml Vulkan 的 fp16 混合点积（`v_dot2_f32_f16`，dot_product_funcs.glsl）只在 **F16 权重 matmul** 命中；**conv2d op 的 shmem 在 coopmat2/cm1 设备上为 FP16**（ggml-vulkan.cpp `conv2d_use_fp16_shmem = coopmat2 || cm1`，RTX3060 命中 KHR_coopmat）。这影响 **VAE decoder（f16 conv）与 RMBG**（vulkan decode 1.7e-2 vs cuda 3.1e-3 的候选主因），不影响 CLIP/VAE encoder（f32 路径）。
+- **VAE encoder 首个放大点**：rs_norm1（GroupNorm）1.4e-4 → 1.2e-3，之后 conv/matmul 单调累积到 1.76。norm 归约（sum/var）重排是放大器（near-zero 输出元素被 inv_std 放大，均值仍 ~1e-6）。
+- **UNet staged-dump**：`IM_VAE_DUMP=1` 在 GPU 上会因 dump 节点撑爆 65536 图容量导致 gallocr 分配失败（CPU 正常）——UNet 逐层 dump 需先裁剪 dump 点或扩容图；组件级已用 test_unet 数值覆盖（cuda 9.4e-4 / vulkan 2.5e-2）。
+- **E2E（zero123pp 8 步 f16，seed 42）**：CUDA 32.3s / Vulkan 34.8s 跑通；最终 latents CUDA vs Vulkan PSNR 45.8dB、grid PSNR 33.5dB —— 视觉一致。
+- **下一步**：把 VAE encode/clip 的 GPU 验收阈值按 re-rounding 预期定档（如 encode ≤ 1e-1 f16 路径 / clip ≤ 5e-3）；或逐 op 收紧（定位 Vulkan 首个放大点）。
 
 ---
 
@@ -104,6 +131,6 @@
 - **staged dump 必须配 `ggml_set_output()`**（gallocr 会回收无直接消费者的张量，非传递！）；
 - 对照前必须 `rm /tmp/vae_*.bin /tmp/ref_*.bin` 清理并核对文件大小（跨轮次污染）；
 - torch 参考生成用 `/tmp/vref` venv（transformers 4.52.4 + huggingface_hub 0.36.2 + diffusers 0.39.0）；参考脚本注意 GN 裸输出 vs 带 affine、diffusers 非对称下采样两处易错点；
-- CMake 注释中 "v0.18.1" 已过时：vendored ggml 实为 **v0.21.0**。
+- **Vulkan 回归注意**：测试设备选择通过 argv[1]（`cuda`/`vulkan`/`cpu`）；Vulkan 后端数学与 CUDA 存在 re-rounding 级差异（f32 应 ~1e-6 量级），阈值对齐 torch fixture 而非 CUDA 位级。
 
 ---

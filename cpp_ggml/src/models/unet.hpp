@@ -58,16 +58,18 @@ bool unet_load(const std::string & path, ggml_backend_t backend,
                UnetModel & out, std::string * error);
 
 // One RefOnly double-forward at a fixed integer timestep. Both passes run on
-// batch B (`sample` and `ref_sample` are [B,4,H,W] torch-NCHW bytes;
-// `context` is the [B,L,1024] torch bytes fed to every cross-attention).
-// Returns host [B,4,H,W] float32 (the eps prediction of the r-pass).
-// Caller frees. This allocates a fresh graph per call — the pipeline will
-// amortize later if needed.
+// batch B (`sample` is the [B,4,H,W] torch-NCHW r-pass input;
+// `ref_sample` is the [B,4,ref_h,ref_w] torch-NCHW w-pass input — the
+// official pipeline denoises at 120x80 while the condition latent is 64x64,
+// so the two resolutions differ and RefOnly K/V is cat(h_r, h_w) along the
+// sequence axis; `context` is the [B,L,1024] torch bytes fed to every
+// cross-attention). Returns host [B,4,H,W] float32 (the eps prediction of
+// the r-pass). Caller frees. This allocates a fresh graph per call.
 float * unet_forward_refonly(const UnetModel & model,
                              const float * sample, const float * ref_sample,
                              const float * context, int context_len,
-                             int B, int H, int W, float timestep,
-                             int * out_h, int * out_w);
+                             int B, int H, int W, int ref_h, int ref_w,
+                             float timestep, int * out_h, int * out_w);
 
 } // namespace instantmesh
 

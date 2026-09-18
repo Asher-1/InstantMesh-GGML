@@ -54,7 +54,8 @@ def main():
              for name in unet.attn_processors.keys()}
     unet.set_attn_processor(procs)
 
-    B, H, W = 2, 80, 120
+    # Match the real pipeline: latents are [H=120, W=80] (960x640 input image).
+    B, H, W = 2, 120, 80
     sample = torch.randn(B, 4, H, W)
     ref_in = torch.randn(B, 4, H, W)
     ctx = torch.randn(B, 77, 1024)
@@ -82,15 +83,20 @@ def main():
     put(os.path.join(out_dir, "unet_eps_out.bin"), eps)
 
     # staged refs under /tmp (names aligned with the C++ IM_VAE_DUMP points)
-    def dump_stage(name, arr):
-        arr.detach().cpu().float().numpy().tofile(f"/tmp/ref_unet_{name}.bin")
+    cur_pass = {"p": "ref"}
 
-    def hook_of(name):
+    def dump_stage(name, arr):
+        arr.detach().cpu().float().numpy().tofile(
+            f"/tmp/{cur_pass['p']}_unet_{name}.bin")
+
+    def hook_of(name, tag=None):
         def f(m, i, o):
+            if tag is not None:
+                print(f"  HOOK {name} input==sample:{torch.equal(i[0], sample)} input==ref:{torch.equal(i[0], ref_in)}")
             dump_stage(name, o if not isinstance(o, tuple) else o[0])
         return f
 
-    unet.conv_in.register_forward_hook(hook_of("w.conv_in"))
+    unet.conv_in.register_forward_hook(hook_of("w.conv_in", tag="conv"))
     for lvl in range(4):
         for j in range(2):
             unet.down_blocks[lvl].resnets[j].register_forward_hook(
@@ -112,13 +118,55 @@ def main():
     r0.time_emb_proj.register_forward_hook(hook_of("down_blocks.0.resnets.0.te"))
     r0.norm2.register_forward_hook(hook_of("down_blocks.0.resnets.0.norm2"))
     r0.conv2.register_forward_hook(hook_of("down_blocks.0.resnets.0.conv2"))
+    r1 = unet.down_blocks[0].resnets[1]
+    r1.register_forward_hook(hook_of("w.d0.r1_out"))
+    r1.norm1.register_forward_hook(hook_of("down_blocks.0.resnets.1.norm1"))
+    r1.conv1.register_forward_hook(hook_of("down_blocks.0.resnets.1.conv1"))
+    r1.time_emb_proj.register_forward_hook(hook_of("down_blocks.0.resnets.1.te"))
+    r1.norm2.register_forward_hook(hook_of("down_blocks.0.resnets.1.norm2"))
+    r1.conv2.register_forward_hook(hook_of("down_blocks.0.resnets.1.conv2"))
+    tb0 = unet.down_blocks[0].attentions[0].transformer_blocks[0]
+    tb0.norm1.register_forward_hook(hook_of("down_blocks.0.attentions.0.transformer_blocks.0.tbnorm1"))
+    tb0.attn1.register_forward_hook(hook_of("down_blocks.0.attentions.0.transformer_blocks.0.tbattn1"))
+    tb0.norm2.register_forward_hook(hook_of("down_blocks.0.attentions.0.transformer_blocks.0.tbnorm2"))
+    tb0.attn2.register_forward_hook(hook_of("down_blocks.0.attentions.0.transformer_blocks.0.tbattn2"))
+    tb0.norm3.register_forward_hook(hook_of("down_blocks.0.attentions.0.transformer_blocks.0.tbnorm3"))
+    tb0.ff.register_forward_hook(hook_of("down_blocks.0.attentions.0.transformer_blocks.0.tbff"))
+    # mid block internals (w-pass divergence point)
+    tm = unet.mid_block.attentions[0]
+    tm.norm.register_forward_hook(hook_of("mid_block.attentions.0.tgn"))
+    tm.proj_in.register_forward_hook(hook_of("mid_block.attentions.0.tproj"))
+    tm.proj_in.register_forward_pre_hook(
+        lambda m, a: dump_stage("mid_block.attentions.0.tgather", a[0]))
+    mtb = tm.transformer_blocks[0]
+    mtb.norm1.register_forward_hook(hook_of("mid_block.attentions.0.transformer_blocks.0.tbnorm1"))
+    mtb.attn1.register_forward_hook(hook_of("mid_block.attentions.0.transformer_blocks.0.tbattn1"))
+    mtb.norm2.register_forward_hook(hook_of("mid_block.attentions.0.transformer_blocks.0.tbnorm2"))
+    mtb.attn2.register_forward_hook(hook_of("mid_block.attentions.0.transformer_blocks.0.tbattn2"))
+    mtb.norm3.register_forward_hook(hook_of("mid_block.attentions.0.transformer_blocks.0.tbnorm3"))
+    mtb.ff.register_forward_hook(hook_of("mid_block.attentions.0.transformer_blocks.0.tbff"))
+    for mr_i, mr in enumerate(unet.mid_block.resnets):
+        mr.norm1.register_forward_hook(hook_of(f"mid_block.resnets.{mr_i}.norm1"))
+        mr.conv1.register_forward_hook(hook_of(f"mid_block.resnets.{mr_i}.conv1"))
+        mr.norm2.register_forward_hook(hook_of(f"mid_block.resnets.{mr_i}.norm2"))
+        mr.conv2.register_forward_hook(hook_of(f"mid_block.resnets.{mr_i}.conv2"))
+    rd = {}
     with torch.no_grad():
         unet(ref_in, torch.full((B,), t),
              encoder_hidden_states=ctx,
-             cross_attention_kwargs=dict(mode="w", ref_dict={}))
+             cross_attention_kwargs=dict(mode="w", ref_dict=rd))
+    print("after w-pass rd keys:", len(rd))
+    # r-pass staged values (same hooks; pop-consumes the same ref_dict)
+    cur_pass["p"] = "ref_r"
+    with torch.no_grad():
+        unet(sample, torch.full((B,), t),
+             encoder_hidden_states=ctx,
+             cross_attention_kwargs=dict(mode="r", ref_dict=rd))
+    print("after r-pass rd keys:", len(rd))
 
     # the official ref_dict values themselves (attn1 inputs, torch order)
-    # re-collect in a clean pass (pop-consumed above)
+    # re-collect in a clean pass (pop-consumed above); keep ref_* files w-pass
+    cur_pass["p"] = "ref"
     ref_dict2 = {}
     with torch.no_grad():
         unet(ref_in, torch.full((B,), t),

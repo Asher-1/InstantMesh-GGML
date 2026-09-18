@@ -11,6 +11,38 @@ index 11ed9e8b..0e38bc26 100644
      # Get current git commit hash
      execute_process(COMMAND ${GIT_EXE} rev-parse --short HEAD
          WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+diff --git a/include/ggml-vulkan.h b/include/ggml-vulkan.h
+index ed5ea5f7..fa573cf1 100644
+--- a/include/ggml-vulkan.h
++++ b/include/ggml-vulkan.h
+@@ -24,6 +24,27 @@ GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_vk_host_buffer_type(voi
+ 
+ GGML_BACKEND_API ggml_backend_reg_t ggml_backend_vk_reg(void);
+ 
++// Route F32×F32→F32 matmuls through the exact FP32 scalar pipelines instead of
++// the shared tensor-core shaders (which stage operands through F16 and silently
++// round f32 data). Default: true. Set to false to trade exactness for speed on
++// large f32 matmuls. f16/quantized matmuls are unaffected (always tensor cores).
++GGML_BACKEND_API void ggml_backend_vk_set_f32_matmul_exact(bool exact);
++
++// Force GGML_OP_CONV_2D dispatch onto the scalar (non-coopmat) conv2d pipelines.
++// Default: false (upstream behavior). Model graphs that need deterministic
++// scalar convolutions (RMBG/BiRefNet) opt in explicitly.
++GGML_BACKEND_API void ggml_backend_vk_set_scalar_direct_conv(bool scalar);
++
++// Create Vulkan devices with fp16 storage/compute shaders disabled (all
++// shaders run fp32, f16 weights are dequantized per matmul). Default: true
++// (hardware capability). Long sampling runs need false: f16-weight matmuls
++// stage f32 activations through f16 and the rounding error compounds step
++// over step. Latched per device at creation — must be called before the
++// first ggml_backend_vk_init/ggml_backend_dev_init on the Vulkan device.
++// Replaces the GGML_VK_DISABLE_F16 env switch (the env still works and ANDs
++// with this flag).
++GGML_BACKEND_API void ggml_backend_vk_set_fp16(bool fp16);
++
+ #ifdef  __cplusplus
+ }
+ #endif
 diff --git a/include/ggml.h b/include/ggml.h
 index 32462d79..6e2bd31b 100644
 --- a/include/ggml.h
@@ -24,6 +56,22 @@ index 32462d79..6e2bd31b 100644
  #endif
  
  #define GGML_DEFAULT_N_THREADS  4
+diff --git a/src/ggml-cpu/ops.cpp b/src/ggml-cpu/ops.cpp
+index 2b5f6844..1fa83950 100644
+--- a/src/ggml-cpu/ops.cpp
++++ b/src/ggml-cpu/ops.cpp
+@@ -4140,6 +4140,11 @@ static void ggml_compute_forward_group_norm_f32(
+             }
+             const float variance = sum2 / (ne00 * ne01 * step);
+             const float scale = 1.0f / sqrtf(variance + eps);
++            if (getenv("IM_GN_DEBUG") && i03 == 0 && i == 0 && mean != 0.0f) {
++                fprintf(stderr, "[GN] grp=%d mean=%g var=%g ne=[%lld %lld %lld %lld] nth=%d\n",
++                        (int)i, mean, variance, (long long)ne00, (long long)ne01,
++                        (long long)ne02, (long long)ne03, nth);
++            }
+ 
+             for (int64_t i02 = start; i02 < end; i02++) {
+                 for (int64_t i01 = 0; i01 < ne01; i01++) {
 diff --git a/src/ggml-cuda/CMakeLists.txt b/src/ggml-cuda/CMakeLists.txt
 index d3953eee..c567b918 100644
 --- a/src/ggml-cuda/CMakeLists.txt
@@ -974,7 +1022,7 @@ index 00000000..46f9b9e5
 +bool ggml_cuda_is_rmbg_affine_relu(const ggml_tensor * dst);
 +void ggml_cuda_op_rmbg_affine(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 diff --git a/src/ggml-vulkan/ggml-vulkan.cpp b/src/ggml-vulkan/ggml-vulkan.cpp
-index f6cbaecb..6fd372a6 100644
+index f6cbaecb..68dcf95c 100644
 --- a/src/ggml-vulkan/ggml-vulkan.cpp
 +++ b/src/ggml-vulkan/ggml-vulkan.cpp
 @@ -897,6 +897,14 @@ struct vk_device_struct {
@@ -1141,8 +1189,8 @@ index f6cbaecb..6fd372a6 100644
          }
 +
 +        // CM1 devices normally instantiate only cooperative-matrix pipelines.
-+        // Keep the exact FP32 scalar variants available as well so a graph can
-+        // use tensor cores only for layers that pass its numerical gate.
++        // Keep the exact FP32 scalar variants available as well: F32×F32→F32
++        // matmuls are routed here by default (ggml_backend_vk_set_f32_matmul_exact).
 +        const std::vector<uint32_t> scalar_l = {
 +            128, 128, 128, 16, subgroup_size_8 * 2, 64, 2, 4, 4, 1, subgroup_size_8};
 +        const std::vector<uint32_t> scalar_m = {
@@ -1241,49 +1289,65 @@ index f6cbaecb..6fd372a6 100644
          std::vector<uint32_t> conv3d_spec_constants = { conv2d_WG_SIZE, conv2d_BS.K, conv2d_BS.CRS, conv2d_BS.NPQ, conv2d_TS_K, conv2d_SHMEM_PAD };
  #define CREATE_CONV3D(type_suffix, spv_suffix) \
          for (auto &c : device->pipeline_conv3d##type_suffix[s]) { \
-@@ -9160,6 +9343,61 @@ static vk_pipeline ggml_vk_get_64b_indexing_pipeline(ggml_backend_vk_context * c
+@@ -6156,6 +6339,18 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
+ static bool ggml_vk_khr_cooperative_matrix_support(const vk::PhysicalDeviceProperties& props, const vk::PhysicalDeviceDriverProperties& driver_props, vk_device_architecture arch);
+ static uint32_t ggml_vk_intel_shader_core_count(const vk::PhysicalDevice& vkdev);
+ 
++// Device fp16 shader capability switch (default ON = hardware capability).
++// When false, the device is created with fp16 storage/compute disabled: f16
++// weights are dequantized per matmul and all shaders run fp32. Required for
++// long sampling runs — f16-weight matmuls stage f32 activations through f16
++// and the rounding error compounds step over step (zero123++ 75-step E2E:
++// grid PSNR 28.8dB with fp16 vs 54.9dB without). Latched per device at
++// creation (ggml_vk_get_device), so callers must invoke
++// ggml_backend_vk_set_fp16() before the first ggml_backend_dev_init on the
++// Vulkan device. Replaces the GGML_VK_DISABLE_F16 env switch for
++// programmatic callers; the env remains supported and ANDs with this flag.
++static bool ggml_vk_fp16_devices = true;
++
+ static vk_device ggml_vk_get_device(size_t idx) {
+     VK_LOG_DEBUG("ggml_vk_get_device(" << idx << ")");
+ 
+@@ -6438,7 +6633,7 @@ static vk_device ggml_vk_get_device(size_t idx) {
+ 
+         const bool force_disable_f16 = getenv("GGML_VK_DISABLE_F16") != nullptr;
+ 
+-        device->fp16 = !force_disable_f16 && fp16_storage && fp16_compute;
++        device->fp16 = !force_disable_f16 && ggml_vk_fp16_devices && fp16_storage && fp16_compute;
+ 
+         if (!ggml_vk_khr_cooperative_matrix_support(device->properties, driver_props, device->architecture)) {
+             device->coopmat_support = false;
+@@ -9160,6 +9355,49 @@ static vk_pipeline ggml_vk_get_64b_indexing_pipeline(ggml_backend_vk_context * c
      return pipeline;
  }
  
-+static bool ggml_vk_rmbg_tensor_matches(const ggml_tensor * tensor, const std::string & token) {
-+    for (const ggml_tensor * current = tensor; current; current = current->view_src) {
-+        const char * name = ggml_get_name(current);
-+        if (name && std::strstr(name, token.c_str())) {
-+            return true;
-+        }
-+    }
-+    return false;
++// Exact-F32 matmul routing (default ON): F32×F32→F32 matmuls are dispatched to
++// the FP32 scalar pipelines instead of the shared tensor-core shaders, which
++// stage their operands through F16 (FLOAT_TYPE=float16_t is baked in at
++// shader-gen time) and would silently round f32 data. f16/quantized matmuls
++// always keep the coopmat/tensor-core pipelines. See docs/ALIGNMENT.md
++// "Vulkan f16 traps".
++static bool ggml_vk_f32_matmul_exact = true;
++
++void ggml_backend_vk_set_f32_matmul_exact(bool exact) {
++    ggml_vk_f32_matmul_exact = exact;
 +}
 +
-+static bool ggml_vk_rmbg_force_scalar_matmul(const ggml_tensor * src0,
-+                                               const ggml_tensor * src1,
-+                                               const ggml_tensor * dst) {
-+    const char * whitelist = std::getenv("RMBG_VK_COOPMAT_MATMUL");
-+    if (!whitelist) {
-+        return false;
-+    }
++// Explicit scalar-conv2d routing (default OFF, upstream behavior): when true,
++// GGML_OP_CONV_2D is dispatched to the scalar conv2d pipelines instead of the
++// coopmat-capable ones. Replaces the former RMBG_VK_SCALAR_DIRECT_CONV env.
++static bool ggml_vk_scalar_direct_conv = false;
 +
-+    const std::string filters(whitelist);
-+    size_t start = 0;
-+    while (start <= filters.size()) {
-+        const size_t end = filters.find(',', start);
-+        const size_t length = (end == std::string::npos ? filters.size() : end) - start;
-+        const std::string token = filters.substr(start, length);
-+        if (token == "*" || (!token.empty() &&
-+            (ggml_vk_rmbg_tensor_matches(src0, token) ||
-+             ggml_vk_rmbg_tensor_matches(src1, token) ||
-+             ggml_vk_rmbg_tensor_matches(dst, token)))) {
-+            return false;
-+        }
-+        if (end == std::string::npos) {
-+            break;
-+        }
-+        start = end + 1;
-+    }
-+    return true;
++void ggml_backend_vk_set_scalar_direct_conv(bool scalar) {
++    ggml_vk_scalar_direct_conv = scalar;
 +}
 +
-+static vk_matmul_pipeline ggml_vk_rmbg_scalar_matmul_pipeline(
++// See ggml_vk_fp16_devices above (defined before ggml_vk_get_device).
++void ggml_backend_vk_set_fp16(bool fp16) {
++    ggml_vk_fp16_devices = fp16;
++}
++
++static vk_matmul_pipeline ggml_vk_scalar_matmul_pipeline(
 +        const vk_device & device, ggml_type src0_type, ggml_type src1_type) {
 +    if (src0_type == GGML_TYPE_F32 && src1_type == GGML_TYPE_F32) {
 +        return device->pipeline_matmul_f32_scalar;
@@ -1303,14 +1367,15 @@ index f6cbaecb..6fd372a6 100644
  static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, bool disable_split_k) {
      VK_LOG_DEBUG("ggml_vk_mul_mat_q_f16((" << src0 << ", name=" << src0->name << ", type=" << ggml_type_name(src0->type) << ", ne0=" << src0->ne[0] << ", ne1=" << src0->ne[1] << ", ne2=" << src0->ne[2] << ", ne3=" << src0->ne[3] << ", nb0=" << src0->nb[0] << ", nb1=" << src0->nb[1] << ", nb2=" << src0->nb[2] << ", nb3=" << src0->nb[3];
      std::cerr << "), (" << src1 << ", name=" << src1->name << ", type=" << ggml_type_name(src1->type) << ", ne0=" << src1->ne[0] << ", ne1=" << src1->ne[1] << ", ne2=" << src1->ne[2] << ", ne3=" << src1->ne[3] << ", nb0=" << src1->nb[0] << ", nb1=" << src1->nb[1] << ", nb2=" << src1->nb[2] << ", nb3=" << src1->nb[3];
-@@ -9227,6 +9465,17 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
+@@ -9227,6 +9465,18 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
          quantize_y = false;
      }
  
-+    if (ctx->device->coopmat_support &&
-+        ggml_vk_rmbg_force_scalar_matmul(src0, src1, dst)) {
++    if (ggml_vk_f32_matmul_exact &&
++        src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32 &&
++        dst->type == GGML_TYPE_F32) {
 +        const ggml_type scalar_src1_type = y_non_contig ? f16_type : src1->type;
-+        vk_matmul_pipeline scalar = ggml_vk_rmbg_scalar_matmul_pipeline(
++        vk_matmul_pipeline scalar = ggml_vk_scalar_matmul_pipeline(
 +            ctx->device, src0->type, scalar_src1_type);
 +        if (scalar) {
 +            mmp = scalar;
@@ -1321,12 +1386,11 @@ index f6cbaecb..6fd372a6 100644
      const bool qx_needs_dequant = mmp == nullptr || x_non_contig;
      const bool qy_needs_dequant = !quantize_y && ((src1->type != f16_type && !y_f32_kernel) || y_non_contig);
  
-@@ -11749,10 +11998,14 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const
+@@ -11749,10 +11999,13 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const
  
              std::map<vk_conv2d_pipeline_state, vk_pipeline> *pipelines = nullptr;
              if (op == GGML_OP_CONV_2D) {
-+                const char *scalar_conv = std::getenv("RMBG_VK_SCALAR_DIRECT_CONV");
-+                const bool force_scalar = scalar_conv && scalar_conv[0] && scalar_conv[0] != '0';
++                const bool force_scalar = ggml_vk_scalar_direct_conv;
                  if (src0->type == GGML_TYPE_F32) {
 -                    pipelines = &ctx->device->pipeline_conv2d_f32[shape];
 +                    pipelines = force_scalar ? &ctx->device->pipeline_conv2d_f32_scalar[shape]

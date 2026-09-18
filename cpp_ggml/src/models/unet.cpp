@@ -46,8 +46,12 @@ static std::vector<std::string> g_u_dump_nm;
 static bool g_u_dump = false;
 static ggml_cgraph * g_u_gf = nullptr;
 static std::string g_u_pass = "w"; // dump-name prefix: "w"/"r"
+static bool g_u_stage_ok(const std::string & nm) {
+    const char * f = std::getenv("IM_DUMP_STAGES");
+    return !f || !*f || std::string(f).find(nm) != std::string::npos;
+}
 static void u_mark(ggml_context * ctx, ggml_tensor * t, const std::string & nm) {
-    if (g_u_dump) {
+    if (g_u_dump && g_u_stage_ok(nm)) {
         ggml_tensor * d = ggml_cont(ctx, t);
         g_u_dump_t.push_back(d); g_u_dump_nm.push_back(g_u_pass + "." + nm);
         ggml_build_forward_expand(g_u_gf, d);
@@ -203,10 +207,12 @@ ggml_tensor * attn_qkv(ggml_context * ctx, const UnetModel & m,
     // att per head then cat along ne0 to rebuild [Ci, HW, B].
     std::vector<ggml_tensor *> o_heads(heads);
     for (int hi = 0; hi < heads; ++hi) {
-        ggml_tensor * qh = ggml_view_3d(ctx, q, hd, HW, B,
-                                        q->nb[1], q->nb[2], (size_t) hi * hd * sizeof(float));
-        ggml_tensor * kh = ggml_view_3d(ctx, k, hd, L, B,
-                                        k->nb[1], k->nb[2], (size_t) hi * hd * sizeof(float));
+        // cont() matters: strided views as matmul operands make the Vulkan
+        // backend copy them to F16 (x/y_non_contig path), silently rounding.
+        ggml_tensor * qh = ggml_cont(ctx, ggml_view_3d(ctx, q, hd, HW, B,
+                                        q->nb[1], q->nb[2], (size_t) hi * hd * sizeof(float)));
+        ggml_tensor * kh = ggml_cont(ctx, ggml_view_3d(ctx, k, hd, L, B,
+                                        k->nb[1], k->nb[2], (size_t) hi * hd * sizeof(float)));
         ggml_tensor * vh = ggml_view_3d(ctx, v, hd, L, B,
                                         v->nb[1], v->nb[2], (size_t) hi * hd * sizeof(float));
         // att[i,j] = softmax_i(q_j · k_i * scale)
@@ -235,31 +241,47 @@ ggml_tensor * transformer_block(ggml_context * ctx, const UnetModel & m,
                                 ggml_tensor * ref_in, ggml_tensor ** ref_out) {
     // 1) self-attention (or RefOnly r cross-with-self). RefOnly 'w' stores
     // exactly this post-LN input (ReferenceOnlyAttnProc wraps attn1).
+    ggml_tensor * h0 = h;   // residual target is the PRE-norm hidden state
     h = ln(ctx, h, get_t(m, p + "norm1.weight"), get_t(m, p + "norm1.bias"),
            m.hp.norm_eps);
     if (ref_out) *ref_out = h;
+    u_mark(ctx, h, p + "tbnorm1");
     ggml_tensor * kv = ref_in ? ggml_concat(ctx, h, ref_in, 1) : h;
     ggml_tensor * a = attn_qkv(ctx, m, h, kv, p + "attn1.", heads);
-    h = ggml_add(ctx, h, a);
+    u_mark(ctx, a, p + "tbattn1");
+    h = ggml_add(ctx, h0, a);
     // 2) cross-attention on context
+    h0 = h;
     h = ln(ctx, h, get_t(m, p + "norm2.weight"), get_t(m, p + "norm2.bias"),
            m.hp.norm_eps);
+    u_mark(ctx, h, p + "tbnorm2");
     a = attn_qkv(ctx, m, h, context, p + "attn2.", heads);
-    h = ggml_add(ctx, h, a);
+    u_mark(ctx, a, p + "tbattn2");
+    h = ggml_add(ctx, h0, a);
     // 3) GEGLU feed-forward
+    h0 = h;
     h = ln(ctx, h, get_t(m, p + "norm3.weight"), get_t(m, p + "norm3.bias"),
            m.hp.norm_eps);
+    u_mark(ctx, h, p + "tbnorm3");
     {
         ggml_tensor * g = ggml_mul_mat(ctx, get_t(m, p + "ff.net.0.proj.weight"), h); // [2I, HW, B]
+        if (has_t(m, p + "ff.net.0.proj.bias")) g = ggml_add(ctx, g, get_t(m, p + "ff.net.0.proj.bias"));
+        u_mark(ctx, g, p + "tbproj");
         const int64_t I = g->ne[0] / 2;
         ggml_tensor * u = ggml_view_3d(ctx, g, I, g->ne[1], g->ne[2],
                                        g->nb[1], g->nb[2], 0);
         ggml_tensor * gate = ggml_view_3d(ctx, g, I, g->ne[1], g->ne[2],
                                           g->nb[1], g->nb[2], I * sizeof(float));
-        gate = ggml_gelu(ctx, gate);
+        // CUDA unary ops require a contiguous src0; the half-split view is
+        // strided (nb1 skips the other half), so materialize it first.
+        gate = ggml_gelu(ctx, ggml_cont(ctx, gate));
+        u_mark(ctx, gate, p + "tbgate");
         ggml_tensor * ff = ggml_mul(ctx, u, gate);
+        u_mark(ctx, ff, p + "tbmul");
         ff = ggml_mul_mat(ctx, get_t(m, p + "ff.net.2.weight"), ff);
-        h = ggml_add(ctx, h, ff);
+        if (has_t(m, p + "ff.net.2.bias")) ff = ggml_add(ctx, ff, get_t(m, p + "ff.net.2.bias"));
+        u_mark(ctx, ff, p + "tbff");
+        h = ggml_add(ctx, h0, ff);
     }
     return h;
 }
@@ -413,16 +435,18 @@ bool unet_load(const std::string & path, ggml_backend_t backend,
 float * unet_forward_refonly(const UnetModel & m,
                              const float * sample, const float * ref_sample,
                              const float * context, int context_len,
-                             int B, int H, int W, float timestep,
-                             int * out_h, int * out_w) {
+                             int B, int H, int W, int ref_h, int ref_w,
+                             float timestep, int * out_h, int * out_w) {
     ggml_init_params ip = { (size_t) 8 << 30, nullptr, true };
     ggml_context * ctx = ggml_init(ip);
     const auto & hp = m.hp;
     const int L = context_len;
 
-    // inputs (torch NCHW bytes / [B,L,1024])
+    // inputs (torch NCHW bytes / [B,L,1024]); the w-pass condition latent
+    // may differ in resolution from the r-pass sample (zero123pp denoises at
+    // 120x80 while cond is 64x64), so ref_t carries its own ref_h/ref_w.
     ggml_tensor * sample_t   = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, W, H, hp.in_channels, B);
-    ggml_tensor * ref_t      = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, W, H, hp.in_channels, B);
+    ggml_tensor * ref_t      = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, ref_w, ref_h, hp.in_channels, B);
     ggml_tensor * context_t  = ggml_new_tensor_3d(ctx, GGML_TYPE_F32,
                                                   hp.cross_attention_dim, L, B);
     std::vector<ggml_tensor *> dumps;   // staged parity points
@@ -436,7 +460,7 @@ float * unet_forward_refonly(const UnetModel & m,
     ggml_tensor * temb = time_embedding(ctx, m, timestep, B, &emb_in); // [1280, B]
     u_mark(ctx, temb, "temb");
     auto dmark = [&](ggml_tensor * t, const char * nm) {
-        if (dump) {
+        if (dump && g_u_stage_ok(nm)) {
             ggml_tensor * d = ggml_cont(ctx, t);
             dumps.push_back(d); dump_nm.push_back(nm);
             ggml_build_forward_expand(gf, d);
@@ -451,16 +475,19 @@ float * unet_forward_refonly(const UnetModel & m,
         std::vector<ggml_tensor *> skips;
         ggml_tensor * cur = conv_f32(ctx, to_conv(ctx, x_in),
                                      get_t(m, "conv_in.weight"), get_t(m, "conv_in.bias"), 1, 1);
-        if (is_w) dmark(cur, "w.conv_in");
+        dmark(cur, (is_w ? "w.conv_in" : "r.conv_in"));
         skips.push_back(cur);
         // ── down ──
         for (int lvl = 0; lvl < 4; ++lvl) {
             const std::string bp = "down_blocks." + std::to_string(lvl) + ".";
             for (int j = 0; j < hp.layers_per_block; ++j) {
-                // CrossAttnDownBlock2D: resnet then transformer, per layer
+                // CrossAttnDownBlock2D: resnet then transformer per layer. The
+                // skip connection must carry the POST-attention state (torch's
+                // CrossAttnDownBlock2D appends output_states after attn);
+                // DownBlock2D (lvl 3) has no attention.
                 cur = resnet(ctx, m, cur, temb, bp + "resnets." + std::to_string(j) + ".");
-                skips.push_back(cur);
-                if (is_w) dmark(cur, ("w.d" + std::to_string(lvl) + ".r" + std::to_string(j)).c_str());
+                dmark(cur, (is_w ? ("w.d" + std::to_string(lvl) + ".r" + std::to_string(j))
+                                 : ("r.d" + std::to_string(lvl) + ".r" + std::to_string(j))).c_str());
                 if (lvl < 3) {
                     const int ridx = lvl * hp.layers_per_block + j;
                     cur = transformer(ctx, m, cur, context_t,
@@ -473,6 +500,7 @@ float * unet_forward_refonly(const UnetModel & m,
                         u_mark(ctx, ref_store[ridx], "refstore" + std::to_string(ridx));
                     }
                 }
+                skips.push_back(cur);
             }
             if (lvl < 3) {
                 // symmetric stride-2 pad-1 downsample (downsample_padding=1)
@@ -488,7 +516,7 @@ float * unet_forward_refonly(const UnetModel & m,
                           is_w ? &ref_store[6] : nullptr);
         if (is_w) u_mark(ctx, ref_store[6], "refstore6");
         cur = resnet(ctx, m, cur, temb, "mid_block.resnets.1.");
-        if (is_w) dmark(cur, "w.mid");
+        dmark(cur, (is_w ? "w.mid" : "r.mid"));
         // ── up ──
         for (int lvl = 0; lvl < 4; ++lvl) {
             const std::string bp = "up_blocks." + std::to_string(lvl) + ".";
@@ -510,8 +538,10 @@ float * unet_forward_refonly(const UnetModel & m,
             }
             if (lvl < 3) {
                 cur = ggml_upscale(ctx, cur, 2, GGML_SCALE_MODE_NEAREST);
+                dmark(cur, (std::string(is_w ? "w" : "r") + "up" + std::to_string(lvl) + ".ups").c_str());
                 cur = conv_f32(ctx, cur, get_t(m, bp + "upsamplers.0.conv.weight"),
                                get_t(m, bp + "upsamplers.0.conv.bias"), 1, 1);
+                dmark(cur, (std::string(is_w ? "w" : "r") + "up" + std::to_string(lvl) + ".upc").c_str());
             }
         }
         cur = ggml_group_norm(ctx, cur, hp.norm_num_groups, hp.norm_eps);
@@ -523,8 +553,10 @@ float * unet_forward_refonly(const UnetModel & m,
             cur = ggml_add(ctx, ggml_mul(ctx, cur, gw), gb);
         }
         cur = ggml_silu(ctx, cur);
-        return conv_f32(ctx, cur, get_t(m, "conv_out.weight"),
-                        get_t(m, "conv_out.bias"), 1, 1);
+        cur = conv_f32(ctx, cur, get_t(m, "conv_out.weight"),
+                       get_t(m, "conv_out.bias"), 1, 1);
+        dmark(cur, is_w ? "w.conv_out" : "r.conv_out");
+        return cur;
     };
 
     ggml_tensor * w_out = build_pass(ref_t, /*is_w=*/true);   // ref_vec filled
@@ -572,10 +604,15 @@ float * unet_forward_refonly(const UnetModel & m,
     ggml_backend_tensor_set(sample_t, sample, 0,
                             (size_t) B * hp.in_channels * H * W * sizeof(float));
     ggml_backend_tensor_set(ref_t, ref_sample, 0,
-                            (size_t) B * hp.in_channels * H * W * sizeof(float));
+                            (size_t) B * hp.in_channels * ref_h * ref_w * sizeof(float));
     ggml_backend_tensor_set(context_t, context, 0,
                             (size_t) B * hp.cross_attention_dim * L * sizeof(float));
     ggml_backend_graph_compute(m.backend, gf);
+    // gate: only flush stage dumps when IM_DUMP_T matches this call's timestep
+    const char * dump_t = std::getenv("IM_DUMP_T");
+    if (dump_t && std::atoi(dump_t) != (int) std::lround(timestep)) {
+        g_u_dump_t.clear(); g_u_dump_nm.clear(); g_u_gn2_dump.clear();
+    } else
     for (size_t i = 0; i < dumps.size(); ++i) {
         const size_t n = ggml_nelements(dumps[i]);
         std::vector<float> buf(n);

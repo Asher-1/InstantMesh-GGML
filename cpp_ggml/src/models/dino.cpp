@@ -324,10 +324,12 @@ float * dino_encode(const DinoModel & m, const float * image, const float * came
         for (auto * t : layer_outs) {
             dump_tensors.push_back(ggml_cont(ctx, t));
         }
-        for (auto * t : dump_tensors) ggml_build_forward_expand(gf, t);
+        for (auto * t : dump_tensors) { ggml_set_output(t); ggml_build_forward_expand(gf, t); }
     }
     if (std::getenv("IM_DBG_L0")) {
-        for (auto * t : g_l0_tensors) ggml_build_forward_expand(gf, t);
+        // Same gallocr-reuse pitfall as clip_vision: dump tensors have no
+        // consumers, so keep them alive for the post-compute reads.
+        for (auto * t : g_l0_tensors) { ggml_set_output(t); ggml_build_forward_expand(gf, t); }
     }
 
     ggml_gallocr_alloc_graph(alloc, gf);

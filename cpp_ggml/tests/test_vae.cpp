@@ -42,7 +42,8 @@ std::vector<float> read_bin(const std::string & path, size_t expect) {
 
 } // namespace
 
-int main() {
+int main(int argc, char ** argv) {
+    const char * device = argc > 1 ? argv[1] : "cpu";
     const std::string dir = VAE_FIXTURE_DIR;
     auto enc_in  = read_bin(dir + "/enc_in.bin", (size_t) 1 * 3 * 512 * 512);
     auto enc_lat = read_bin(dir + "/enc_lat.bin", (size_t) 1 * 4 * 64 * 64);
@@ -54,7 +55,7 @@ int main() {
     }
 
     std::string err, dev;
-    ggml_backend_t backend = instantmesh::init_best_backend(dev, "cpu");
+    ggml_backend_t backend = instantmesh::init_best_backend(dev, device);
     instantmesh::VaeModel model;
     if (!backend || !instantmesh::vae_load(VAE_MODEL, backend, model, &err)) {
         std::printf("SKIP: cannot load %s: %s\n", VAE_MODEL, err.c_str());

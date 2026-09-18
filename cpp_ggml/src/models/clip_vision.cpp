@@ -97,20 +97,29 @@ ggml_tensor * clip_vision_layer(ggml_context * ctx, const ClipVisionModel & m,
     // by our hd=64 regression test, and with seq=257 the manual path costs
     // nothing). q/k/v [C, seq, B] -> [hd, seq, nh, B] via c-split (nh outer,
     // hd inner — same order as torch's view(B,seq,nh,hd).transpose).
-    ggml_tensor * qr = ggml_permute(ctx, ggml_reshape_4d(ctx, q, hd, hp.num_attention_heads, seq, B), 0, 2, 1, 3);
+    // cont() matters: a strided permute view as matmul's B operand makes the
+    // Vulkan backend copy Y to F16 (y_non_contig path), silently rounding q.
+    ggml_tensor * qr = ggml_cont(ctx, ggml_permute(ctx, ggml_reshape_4d(ctx, q, hd, hp.num_attention_heads, seq, B), 0, 2, 1, 3));
     ggml_tensor * kr = ggml_cont(ctx, ggml_permute(ctx, ggml_reshape_4d(ctx, k, hd, hp.num_attention_heads, seq, B), 0, 2, 1, 3));
     ggml_tensor * vr = ggml_cont(ctx, ggml_permute(ctx, ggml_reshape_4d(ctx, v, hd, hp.num_attention_heads, seq, B), 1, 2, 0, 3)); // [seq_kv, hd, nh, B]
     // KQ[nh, q, seq, B] = sum_hd k[hd,kv]*q[hd,q]; softmax over kv.
-    std::fprintf(stderr, "cv: kq a=[%lld %lld %lld %lld] b=[%lld %lld %lld %lld]\n",
-        (long long)kr->ne[0], (long long)kr->ne[1], (long long)kr->ne[2], (long long)kr->ne[3],
-        (long long)qr->ne[0], (long long)qr->ne[1], (long long)qr->ne[2], (long long)qr->ne[3]);
+    // Attention shape prints (per-layer), IM_CV_L0-gated so production runs
+    // don't flood stderr (E2E logs grew by thousands of lines otherwise).
+    static const bool dbg_shapes = std::getenv("IM_CV_L0") != nullptr;
+    if (dbg_shapes) {
+        std::fprintf(stderr, "cv: kq a=[%lld %lld %lld %lld] b=[%lld %lld %lld %lld]\n",
+            (long long)kr->ne[0], (long long)kr->ne[1], (long long)kr->ne[2], (long long)kr->ne[3],
+            (long long)qr->ne[0], (long long)qr->ne[1], (long long)qr->ne[2], (long long)qr->ne[3]);
+    }
     ggml_tensor * kq = ggml_mul_mat(ctx, kr, qr); // [seq_kv, seq_q, nh, B]
     kq = ggml_scale(ctx, kq, scale);
     ggml_tensor * att = ggml_soft_max_ext(ctx, kq, nullptr, 1.0f, 0.0f);
     // o[q, hd, nh] = sum_kv att[kv,q]*v[kv,hd]  (v permuted to [kv, hd, nh, B]).
-    std::fprintf(stderr, "cv: o a=[%lld %lld %lld %lld] b=[%lld %lld %lld %lld]\n",
-        (long long)att->ne[0], (long long)att->ne[1], (long long)att->ne[2], (long long)att->ne[3],
-        (long long)vr->ne[0], (long long)vr->ne[1], (long long)vr->ne[2], (long long)vr->ne[3]);
+    if (dbg_shapes) {
+        std::fprintf(stderr, "cv: o a=[%lld %lld %lld %lld] b=[%lld %lld %lld %lld]\n",
+            (long long)att->ne[0], (long long)att->ne[1], (long long)att->ne[2], (long long)att->ne[3],
+            (long long)vr->ne[0], (long long)vr->ne[1], (long long)vr->ne[2], (long long)vr->ne[3]);
+    }
     ggml_tensor * o = ggml_mul_mat(ctx, att, vr); // [seq_q, hd, nh, B]
     // back to [C, seq, B]: permute to [hd, nh, seq] then interleave heads.
     ggml_tensor * attn = ggml_cont(ctx, ggml_permute(ctx, o, 2, 0, 1, 3)); // [hd, nh, seq_q, B]
@@ -238,11 +247,19 @@ float * clip_vision_encode(const ClipVisionModel & m, const float * image,
     if (dump) {
         for (int i = 0; i < 6; ++i) {
             dump_t[i] = ggml_cont(ctx, dump_src[i]);
+            ggml_set_output(dump_t[i]);  // keep alive for the post-compute read
             ggml_build_forward_expand(gf, dump_t[i]);
         }
     }
     if (l0) {
-        for (auto & e : g_dbg) ggml_build_forward_expand(gf, e.t);
+        // Gallocr frees a tensor's buffer right after its last consumer runs;
+        // these dump tensors have NO consumers, so without set_output() the
+        // post-compute reads hit recycled buffers (the repo's documented
+        // "gallocr reuse" pitfall).
+        for (auto & e : g_dbg) {
+            ggml_set_output(e.t);
+            ggml_build_forward_expand(gf, e.t);
+        }
     }
     ggml_gallocr_alloc_graph(alloc, gf);
 

@@ -39,7 +39,8 @@ std::vector<float> read_bin(const std::string & path, size_t expect) {
 
 } // namespace
 
-int main() {
+int main(int argc, char ** argv) {
+    const char * device = argc > 1 ? argv[1] : "cpu";
     const std::string dir = CLIPV_FIXTURE_DIR;
     const size_t n_in = 1 * 3 * 224 * 224;
     const size_t n_out = 1024;
@@ -53,7 +54,7 @@ int main() {
 
     std::string err;
     std::string dev_name;
-    ggml_backend_t backend = instantmesh::init_best_backend(dev_name, "cpu");
+    ggml_backend_t backend = instantmesh::init_best_backend(dev_name, device);
     instantmesh::ClipVisionModel model;
     if (!backend || !instantmesh::clip_vision_load(CLIPV_MODEL, backend, model, &err)) {
         std::printf("SKIP: cannot load %s: %s\n", CLIPV_MODEL, err.c_str());

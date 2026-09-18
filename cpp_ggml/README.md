@@ -156,6 +156,10 @@ cmake -B cpp_ggml/build-gpu -S cpp_ggml -DGGML_CUDA=ON -DGGML_VULKAN=ON \
       -DCMAKE_CUDA_ARCHITECTURES=86 \
       -DVulkan_GLSLC_EXECUTABLE=/usr/local/bin/glslc
 cmake --build cpp_ggml/build-gpu -j
+# Note: if multiple CUDA toolkits are installed (e.g. 11.1/11.4/11.8), the exe
+# link may resolve the wrong libcudart.so.11.0 and fail with
+# "undefined reference to cudaLaunchKernelExC@libcudart.so.11.0". Fix (per-machine):
+#   -DCMAKE_EXE_LINKER_FLAGS="-Wl,--disable-new-dtags -Wl,-rpath,/usr/local/cuda/lib64 -L/usr/local/cuda/lib64 /usr/local/cuda/lib64/libcudart.so.11.0"
 ```
 
 Verify: each build directory produces an `instantmesh` executable; the configure log should show
@@ -165,8 +169,8 @@ Verify: each build directory produces an `instantmesh` executable; the configure
 
 ```bash
 cd cpp_ggml/build && ctest --output-on-failure && cd ../..
-# Expected output: 100% tests passed (5 tests: backend / flashattn / mulmat_tiny /
-# cont_permute / texture_map)
+# Expected output: 100% tests passed (10 tests: backend / flashattn / mulmat_tiny /
+# cont_permute / conv_layout / texture_map / scheduler / clip_vision / vae / unet)
 ```
 
 ### Step 5. First Demo: Image → OBJ Mesh
@@ -246,9 +250,9 @@ idempotent skip; conflict → error and abort. See
 | Vertex-colored OBJ | ✅ Δmean≈0.002 vs PyTorch |
 | Texture-map baking (xatlas + multi-view) | ✅ OBJ+MTL+PNG (official has no PBR, no alignment needed) |
 | f32 / f16 / q8 precisions | ✅ |
-| CUDA / Vulkan / CPU backends | ✅ runtime auto-detection |
-| rembg foreground segmentation (BiRefNet, RMBG-2.0) | 🔨 ggml custom ops already in patches/, model integration in progress |
-| Zero123++ multi-view diffusion (single image → 6 views) | ⏳ planned (current input replicates views) |
+| CUDA / Vulkan / CPU backends | ✅ runtime auto-detection (explicit device via test argv / `--device`) |
+| Zero123++ multi-view diffusion (single image → 6 views) | ✅ `zero123pp` tool: scheduler / CLIPVision / VAE / UNet(RefOnly) 逐组件 parity 全过；E2E PSNR 验收进行中 |
+| rembg foreground segmentation (BiRefNet, RMBG-2.0) | ✅ `rembg` tool + ggml custom ops patch；尚未接入 instantmesh 单命令链 |
 | NeuralRender / GLB export | ⏳ planned |
 
 Full technical design and implementation notes: [../docs/PLAN.md](../docs/PLAN.md).
@@ -260,6 +264,7 @@ Full technical design and implementation notes: [../docs/PLAN.md](../docs/PLAN.m
 - **Parity checks**: [convert/parity_*.py](convert/) generate reference activations;
   C++ compares layer by layer with `atol + rtol*|ref|` (threshold 2e-3; ctest skips
   when fixtures are missing).
-- **Per-model CLIs**: the four tools `dino` / `lrm_transformer` / `synthesizer` / `flexicubes`
+- **Per-model CLIs**: the tools `dino` / `lrm_transformer` / `synthesizer` / `flexicubes`
   can load and run a single model independently (build artifacts live in the build directory),
-  which is handy for layer-by-layer debugging.
+  which is handy for layer-by-layer debugging; `zero123pp` runs the multi-view diffusion
+  pipeline (see `--fixture-dir` for deterministic replay).

@@ -81,11 +81,12 @@ ggml_tensor * conv_f32(ggml_context * ctx, ggml_tensor * x, ggml_tensor * w,
                        ggml_tensor * b, int stride, int pad) {
     ggml_tensor * im2col = ggml_im2col(ctx, w, x, stride, stride, pad, pad, 1, 1,
                                        true, GGML_TYPE_F32);            // [ICKHKW, OW, OH, N]
+    ggml_tensor * wk = ggml_cast(ctx, w, GGML_TYPE_F32);                // keep src1 F32
     ggml_tensor * result = ggml_mul_mat(
             ctx,
             ggml_reshape_2d(ctx, im2col, im2col->ne[0],
                             im2col->ne[3] * im2col->ne[2] * im2col->ne[1]),
-            ggml_reshape_2d(ctx, w, w->ne[0] * w->ne[1] * w->ne[2], w->ne[3]));
+            ggml_reshape_2d(ctx, wk, wk->ne[0] * wk->ne[1] * wk->ne[2], wk->ne[3]));
     result = ggml_reshape_4d(ctx, result, im2col->ne[1], im2col->ne[2],
                              im2col->ne[3], w->ne[3]);
     result = ggml_cont(ctx, ggml_permute(ctx, result, 0, 1, 3, 2));     // [W,H,OC,N]

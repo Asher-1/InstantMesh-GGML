@@ -166,7 +166,9 @@ cmake -B cpp_ggml/build -S cpp_ggml -DINSTANTMESH_BUILD_TESTS=ON && cmake --buil
 
 Feature parity with the official Python side: vertex-colored OBJ and texture baking
 (`--export_texmap` maps to the C++ `--export-texmap`, xatlas UV unwrapping + multi-view
-texture baking) are both implemented and pass parity; the official InstantMesh contains
+texture baking) are both implemented and pass parity; the Zero123++ multi-view diffusion
+pipeline (single image → 6 views: scheduler / CLIPVision / VAE / UNet+RefOnly) is ported
+as the `zero123pp` tool with per-component ctest parity; the official InstantMesh contains
 **no PBR** (no metallic/roughness path), so there is nothing to align there.
 
 ## Reconstruction Quality (ggml vs PyTorch, one figure per demo)

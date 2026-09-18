@@ -56,3 +56,5 @@ blender/
 *.log
 cpp_ggml/build*
 *.gguf
+*.weight
+*.bias

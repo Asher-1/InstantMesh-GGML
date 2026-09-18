@@ -36,14 +36,22 @@ std::vector<float> read_bin(const std::string & path, size_t expect) {
 
 } // namespace
 
-int main() {
-    const std::string dir = UNET_FIXTURE_DIR;
-    const int B = 2, H = 80, W = 120, L = 77;
+int main(int argc, char ** argv) {
+    const char * device = argc > 1 ? argv[1] : "cpu";
+    std::string dir = UNET_FIXTURE_DIR;
+    if (const char * e = std::getenv("UNET_FIXTURE_DIR")) dir = e;
+    // Match the real pipeline (zero123pp.cpp): latents are [H=120, W=80] for
+    // a 960x640 input image. Swapping these transposes the grid and breaks
+    // every spatially-2D op against the torch [B,4,H=120,W=80] reference.
+    const int B = 2, H = 120, W = 80, L = 77;
     const size_t lat_n = (size_t) B * 4 * H * W;
     const size_t ctx_n = (size_t) B * L * 1024;
 
+    int rh = H, rw = W;
+    if (const char * e = std::getenv("UNET_REF_H")) rh = std::atoi(e);
+    if (const char * e = std::getenv("UNET_REF_W")) rw = std::atoi(e);
     auto in    = read_bin(dir + "/unet_in.bin", lat_n);
-    auto refin = read_bin(dir + "/unet_ref_in.bin", lat_n);
+    auto refin = read_bin(dir + "/unet_ref_in.bin", (size_t) B * 4 * rh * rw);
     auto ctx   = read_bin(dir + "/unet_ctx.bin", ctx_n);
     auto tref  = read_bin(dir + "/unet_t.bin", 1);
     auto out   = read_bin(dir + "/unet_eps_out.bin", lat_n);
@@ -53,7 +61,7 @@ int main() {
     }
 
     std::string err, dev;
-    ggml_backend_t backend = instantmesh::init_best_backend(dev, "cpu");
+    ggml_backend_t backend = instantmesh::init_best_backend(dev, device);
     instantmesh::UnetModel model;
     if (!backend || !instantmesh::unet_load(UNET_MODEL, backend, model, &err)) {
         std::printf("SKIP: cannot load %s: %s\n", UNET_MODEL, err.c_str());
@@ -62,8 +70,32 @@ int main() {
     }
 
     int oh = 0, ow = 0;
+    if (std::getenv("IM_WT_DUMP")) {
+        const char * names[] = {
+            "down_blocks.0.attentions.0.transformer_blocks.0.ff.net.0.proj.weight",
+            "down_blocks.0.attentions.0.transformer_blocks.0.ff.net.2.weight",
+            "down_blocks.0.attentions.0.proj_in.weight",
+            "down_blocks.0.attentions.0.proj_in.bias",
+            "mid_block.attentions.0.proj_in.weight",
+            "mid_block.attentions.0.proj_in.bias",
+        };
+        for (auto * nm : names) {
+            auto it = model.gguf.tensors.find(nm);
+            if (it == model.gguf.tensors.end()) { std::printf("missing %s\n", nm); continue; }
+            const ggml_tensor * t = it->second;
+            std::vector<float> buf(ggml_nelements(t));
+            ggml_backend_tensor_get(t, buf.data(), 0, ggml_nbytes(t));
+            std::string fn = std::string("/tmp/wt_") + std::string(nm);
+            for (auto & ch : fn) if (ch == '/') ch = '_';
+            std::FILE * f = std::fopen(fn.c_str(), "wb");
+            if (!f) { std::printf("fopen failed: %s\n", fn.c_str()); continue; }
+            std::fwrite(buf.data(), 4, buf.size(), f);
+            std::fclose(f);
+            std::printf("wrote %s (%zu bytes)\n", fn.c_str(), buf.size() * 4);
+        }
+    }
     float * eps = instantmesh::unet_forward_refonly(model, in.data(), refin.data(),
-                                                    ctx.data(), L, B, H, W,
+                                                    ctx.data(), L, B, H, W, rh, rw,
                                                     tref[0], &oh, &ow);
     double m = 0, sum = 0;
     for (size_t k = 0; k < lat_n; ++k) {

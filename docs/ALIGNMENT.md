@@ -26,7 +26,7 @@ Technical decisions (confirmed):
 - ✅ Weights `models/gguf/rmbg_{f32,f16,q8}.gguf` (same source as the trellis project;
   its parity already verified).
 
-## Phase 1: Zero123++ Multi-View Diffusion (in progress)
+## Phase 1: Zero123++ Multi-View Diffusion (UNet + pipeline 已收敛，剩 E2E 验收)
 
 Completed components (each gated by a ctest parity test; tests SKIP (77) when
 fixtures are absent):
@@ -47,6 +47,15 @@ fixtures are absent):
   are bit-exact). Produced `models/gguf/zero123pp_{unet,vae}_f16.gguf` and
   `zero123pp_cond_f32.gguf` (with text_emb[77,1024], negative_lat, ramp[65],
   alphas_cumprod[1000] constants).
+- ✅ **UNet + RefOnly**: `src/models/unet.{hpp,cpp}` — time-emb MLP, ResBlock
+  (GN/SiLU/conv+skip), self+cross attention (heads 8×head_dim 40,
+  cross_attention_dim=1024, linear projection), down/mid/up + RefOnly w/r
+  double-forward with `ramping_coefficients` scaling. Parity vs torch staged
+  refs: f32 max_abs 7.1e-4, f16 8.8e-4 (`test_unet`, synthetic fixture).
+- ✅ **pipeline assembly**: `src/tools/zero123pp.cpp` — rembg → VAE
+  encode(cond) → CLIPVision → 75-step double-forward (cfg 4.0) → VAE decode →
+  3×2 grid. Supports `--fixture-dir` (replays the official per-step randn),
+  `--dump-final-latents`, `--dump-steps` for E2E acceptance.
 
 Official information flow (`zero123plus/pipeline.py` + `run.py`):
 
@@ -154,11 +163,53 @@ and the asymmetric downsample above. `IM_VAE_DUMP=1` triggers the dumps.
 ## Acceptance Criteria (alignment scope)
 
 - [ ] `cpp_ggml/build/zero123pp` single image → 6 views, matching the official PyTorch
-      (same seed) within a PSNR threshold.
-- [ ] Scheduler numeric parity: add_noise/scale_model_input/step whole-sequence
-      max_abs < 1e-6.
-- [ ] Staged parity for VAE/CLIPVision/UNet: f32 ≤ 2e-3 (atol+rtol threshold), f16/q8
-      within their tolerances.
+      (same seed) within a PSNR threshold. Harness: `convert/dump_e2e.py` (official
+      per-step fixtures: noise/latents/eps/context) + `zero123pp --fixture-dir
+      benchmarks/fixtures/e2e/<name> --dump-final-latents` → compare
+      `ref_latents.bin` and per-view PNGs (PSNR).
+- [x] Scheduler numeric parity: add_noise/scale_model_input/step whole-sequence
+      max_abs < 1e-6 (`test_scheduler` 1.9e-6).
+- [x] Staged parity for VAE/CLIPVision/UNet: f32 ≤ 2e-3 (atol+rtol threshold), f16/q8
+      within their tolerances (`test_vae` encode 2.4e-4 / decode 3e-3,
+      `test_clip_vision` 7.6e-6, `test_unet` f32 7.1e-4 / f16 8.8e-4).
+- [~] CUDA / Vulkan / CPU backend consistency: the same components run on each backend
+      against the same torch fixtures (device via test argv[1]). Status 2026-09-18:
+      CPU 全绿；CUDA 需 `NVIDIA_TF32_OVERRIDE=0`（clip 1.5e-3→1.2e-5），UNet 修复
+      GEGLU 非连续输入后 9.4e-4。Vulkan 的两个 f16 陷阱已定位并在模型侧修复
+      （见下 "Vulkan f16 traps"），CLIP 逐层回归全部 stage 降到 torch fp32 自身
+      舍入水平：patch conv 2.1e-4→1.0e-6、attn_raw 1.8e-4→5.5e-6、端到端
+      embeds 1.5e-3→**4.2e-6**（优于 CPU 7.6e-6）。zero123pp 完整 75 步 E2E
+      （blue_cat，f16 UNet/VAE，seed 42，真实图像无 fixture）：Vulkan 长跑需
+      关 device fp16——现由显式参数 `BackendInitOptions::vulkan_fp16`（默认
+      false，`init_best_backend` 经 `ggml_backend_vk_set_fp16` 在设备创建前
+      应用）内建，无需任何 env；f32 matmul 精确路由同样由显式 API 内建，
+      coopmat 可保持开启服务 f16/量化 matmul。vs CPU 最终 latents max_abs
+      2.3e-2 / mean 5.2e-4（PSNR 70.6dB）、grid PSNR **54.9dB**（视觉不可分
+      辨；残余为 150 次 double-forward 的逐 op fp32 舍入累积）。注意：device
+      fp16 开启时，f16 权重 matmul 的激活 f16 暂存误差随采样步数累积——
+      8 步短跑仅 latents 7.2e-3 / grid 53.4dB，75 步全跑恶化到 latents mean
+      1.9e-2 / grid 28.8dB，**长跑必须关 device fp16**。VAE encode 的 GPU
+      阈值仍需按 re-rounding 预期放宽或逐 op 收紧。
+
+  Vulkan f16 traps（根因与规避，均已验证）:
+  1. **f32 matmul shader 以 f16 暂存**：所有 `matmul_f32_*` SPIR-V 变体
+     （coopmat `_cm1` 与 fp16 编译的 scalar 中间分支）的 `FLOAT_TYPE=float16_t`
+     在构建期由 vulkan-shaders-gen 嵌死，运行时开关只能整支切换。只有
+     `!coopmat && !fp16` 分支用的 `_fp32` 变体是真 fp32。规避：patch 提供
+     显式 API `ggml_backend_vk_set_f32_matmul_exact(bool)`（默认 true），
+     F32×F32→F32 matmul 一律路由到真 fp32 scalar pipeline；f16/量化 matmul
+     不受影响，永远走 coopmat/tensor core；设 false 可换回性能。生产路径的
+     fp16 开关已全部收敛为显式参数：InstantMesh 经
+     `BackendInitOptions::vulkan_fp16`（显式 API `ggml_backend_vk_set_fp16`，
+     `init_best_backend` 在设备创建前应用），RMBG 经 env（设备创建期读取，
+     待后续收敛）；env `GGML_VK_DISABLE_F16` 仍受支持并与显式参数相与，仅作
+     诊断逃生口。实测最小复现 mul_mat 4.6e-3→1.8e-5。
+  2. **非连续 matmul 操作数被隐式转 F16**：`ggml_vk_mul_mat_q_f16` 对未通过
+     `ggml_vk_dim01_contiguous` 的 x/y 操作数先 `cpy → F16` 再派发，f32 数据
+     被静默舍入（per-head strided view、未 cont 的 reshape+permute 都会踩中，
+     典型症状：attention 输出单层 ~1e-4 而非 ~1e-6）。规避：一切 matmul
+     操作数用 `ggml_cont` 物化（clip_vision 的 `qr`、unet 的 `qh/kh`、dino
+     的 `to_head` 已统一处理）。
 - [ ] `instantmesh --image x.png --rmbg rmbg.gguf` (after rembg and Zero123++ are in)
       produces the same mesh as `python run.py` for the same input (same bridged
       baseline).
