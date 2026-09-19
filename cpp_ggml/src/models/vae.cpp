@@ -122,8 +122,7 @@ ggml_tensor * resnet(ggml_context * ctx, const VaeModel & m, ggml_tensor * x,
                      const std::string & prefix, bool f32conv) {
     auto conv_fn = f32conv ? conv_f32 : conv;
     const bool dbg = std::getenv("IM_VAE_DUMP") != nullptr &&
-                     prefix.rfind("encoder.down_blocks.0.", 0) == 0 &&
-                     prefix.find("resnets.0.") != std::string::npos;
+                     prefix.find("encoder.down_blocks.1.resnets.0.") != std::string::npos;
     std::vector<ggml_tensor *> dt; std::vector<std::string> dn;
     auto dmark = [&](ggml_tensor * t, const std::string & nm) {
         if (dbg) { dt.push_back(dump_nchw(ctx, t)); dn.push_back(prefix + nm); }
@@ -265,8 +264,12 @@ float * vae_encode_mode(const VaeModel & m, const float * image,
         cur = resnet(ctx, m, cur, p + "resnets.0.", /*f32conv=*/true);
         cur = resnet(ctx, m, cur, p + "resnets.1.", /*f32conv=*/true);
         if (i < 3) {
-            if (std::getenv("IM_VAE_DUMP") && i == 0)
-                dump_t.push_back(dump_nchw(ctx, cur)), dump_nm.push_back("encoder.down0_pre_ds");
+            if (std::getenv("IM_VAE_DUMP") && i <= 1) {
+                char nm[64];
+                std::snprintf(nm, sizeof(nm), "encoder.down%d_pre_ds", i);
+                dump_t.push_back(dump_nchw(ctx, cur));
+                dump_nm.push_back(nm);
+            }
             // diffusers Downsample2D (padding=0): asymmetric zero-pad of the
             // bottom/right edge (F.pad(x,(0,1,0,1))) THEN a stride-2 padding-0
             // conv. ggml_pad p0/p1/p2/p3 pad AFTER ne0/ne1/ne2/ne3 resp.
@@ -286,6 +289,7 @@ float * vae_encode_mode(const VaeModel & m, const float * image,
     cur = resnet(ctx, m, cur, "encoder.mid_block.resnets.1.", /*f32conv=*/true);
     if (dump) { dump_t.push_back(dump_nchw(ctx, cur)); dump_nm.push_back("encoder.mid1"); }
     cur = gn_silu(ctx, cur, m, "encoder.conv_norm_out.weight", "encoder.conv_norm_out.bias");
+    if (dump) { dump_t.push_back(dump_nchw(ctx, cur)); dump_nm.push_back("encoder.normout_silu"); }
     cur = conv_f32(ctx, cur, get_t(m, "encoder.conv_out.weight"),
                get_t(m, "encoder.conv_out.bias"), 1, 1);
     if (dump) { dump_t.push_back(dump_nchw(ctx, cur)); dump_nm.push_back("encoder.convout"); }

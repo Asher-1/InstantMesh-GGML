@@ -23,3 +23,27 @@ index 14dd1098..fe08aa16 100644
              CUBLAS_CHECK(cublasSetStream(cublas_handles[device][curr_stream_no], stream()));
  #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && (CUBLAS_VER_MAJOR > 11 || (CUBLAS_VER_MAJOR == 11 && CUBLAS_VER_MINOR >= 2))
              if (cublas_workspace_sizes[device] == 0) {
+diff --git a/src/ggml-cuda/mmf.cu b/src/ggml-cuda/mmf.cu
+index 646a5899..c0ef33c2 100644
+--- a/src/ggml-cuda/mmf.cu
++++ b/src/ggml-cuda/mmf.cu
+@@ -180,7 +180,18 @@ bool ggml_cuda_should_use_mmf(enum ggml_type type, int cc, int warp_size, const
+ 
+     switch (type) {
+         case GGML_TYPE_F32:
+-            return ampere_mma_available(cc) || amd_mfma_available(cc);
++            // Ampere fp32 MMA is TF32 tensor core (10-bit mantissas) — the same
++            // precision trap as cuBLAS TF32. Measured: VAE encode conv_out
++            // (src1_ncols=4, thin) lost 270x vs CPU through this path. Disabled
++            // unless GGML_CUDA_TF32=1; AMD MFMA is true fp32 and unaffected.
++            if (GGML_CUDA_CC_IS_NVIDIA(cc) && ampere_mma_available(cc)) {
++                static const bool tf32_ok = [] {
++                    const char * o = getenv("GGML_CUDA_TF32");
++                    return o && o[0] == '1';
++                }();
++                return tf32_ok;
++            }
++            return amd_mfma_available(cc);
+         case GGML_TYPE_F16:
+             return volta_mma_available(cc) || turing_mma_available(cc) || amd_wmma_available(cc) || amd_mfma_available(cc);
+         case GGML_TYPE_BF16:

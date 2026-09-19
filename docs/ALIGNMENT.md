@@ -370,12 +370,19 @@ and the asymmetric downsample above. `IM_VAE_DUMP=1` triggers the dumps.
    `zero123pp --latents-in`，为定位新增的调试入口）。教训：**vs torch 的
    一致性必须至少有一次像素级/视觉级验证，纯张量统计可以全部达标而图像
    全错**。
-3. **遗留（未定位）**：`test_vae` encode CUDA 在 TF32 修复后仍
-   max 1.45e-2（CPU 2.4e-4 / Vulkan 1.27e-4），第二个误差源待查
-   （`IM_VAE_DUMP` tap 已就绪可逐层二分）。影响面：free-run 的 cond_lat
-   （fixture 重放模式的 cond 来自 fixture 不受影响）；扩散是生成性的，
-   该量级不改变重建内容，但 CUDA f32 encode 未达舍入水平前不得作为
-   精度参考。
+3. **VAE encode CUDA 的第二个误差源（已定位并修复）**：TF32 math-mode 修复后
+   `test_vae` encode 仍 1.45e-2（CPU 2.4e-4 / Vulkan 1.3e-4）。经
+   `scripts/vae_encode_bisect.sh` 逐层二分：主链相对误差恒定 1.4e-6（正常），
+   **唯一跳变点 = `encoder.convout`（rel 3.8e-4，跳升 270 倍）**。根因：
+   `ggml_cuda_should_use_mmf` 的 F32 分支在 Ampere 上放行 **fp32 MMA =
+   TF32 tensor core**（10-bit mantissa），且仅 `src1_ncols <= 16` 的薄层命中
+   ——encoder 尾部 conv_out/quant_conv（4 通道输出）正好命中，down 块/
+   resnet（128/256 通道）走 cuBLAS 不受影响。该路径绕开 cuBLAS，故
+   math-mode/FORCE_CUBLAS 均不响应。修复：mmf 的 F32 分支与
+   `GGML_CUDA_TF32` 语义统一（默认关闭，`=1` 恢复）。修复后 encode
+   **1.47e-4 PASS**；`GGML_CUDA_TF32=1` 逐位复现 5.97e-2 的旧行为（归因
+   闭环）。bisect 脚本首跑曾暴露两处脚本健壮性问题（FAIL 判定不应中断
+   采集、对比目录需清空），已随修复一并处理。
 
 修复后 vs torch E2E 矩阵（cute_horse fixture 重放 75 步，grid/view 为
 PNG 像素 PSNR）：

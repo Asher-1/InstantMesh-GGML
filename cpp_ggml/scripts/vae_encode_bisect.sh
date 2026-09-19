@@ -24,6 +24,7 @@ cd "$ROOT"
 FIX="$PWD/benchmarks/fixtures/vae"
 MODEL="$PWD/models/gguf/zero123pp_vae_f32.gguf"
 OUT=/tmp/vaedbg_bisect
+rm -rf "$OUT"
 mkdir -p "$OUT/cpu" "$OUT/$DEV"
 
 run() { # <device> <outdir>
