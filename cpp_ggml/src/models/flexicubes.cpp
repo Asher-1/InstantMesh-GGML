@@ -42,7 +42,7 @@ UniquePairs unique_pairs(const std::vector<int32_t> & ab, size_t n) {
     std::vector<int32_t> idx_of(n);
     for (size_t k = 0; k < n; ++k) {
         int32_t i = order[k], a = ab[2*i], b = ab[2*i+1];
-        if (r.unique.empty() || r.unique[r.unique.size()-2] != a || r.unique[r.unique.size()-1] != b) {
+        if (r.unique.size() < 2 || r.unique[r.unique.size()-2] != a || r.unique[r.unique.size()-1] != b) {
             r.unique.push_back(a); r.unique.push_back(b);
             r.counts.push_back(0);
         }

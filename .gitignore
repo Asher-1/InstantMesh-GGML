@@ -58,3 +58,7 @@ cpp_ggml/build*
 *.gguf
 *.weight
 *.bias
+*.obj.rev
+*.bin.rev
+# keep the baseline cleanup script tracked despite the global *.sh ignore
+!cpp_ggml/benchmarks/clean_stale_baselines.sh

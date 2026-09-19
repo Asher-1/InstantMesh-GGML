@@ -1,0 +1,25 @@
+diff --git a/src/ggml-cuda/common.cuh b/src/ggml-cuda/common.cuh
+index 14dd1098..fe08aa16 100644
+--- a/src/ggml-cuda/common.cuh
++++ b/src/ggml-cuda/common.cuh
+@@ -1501,7 +1501,19 @@ struct ggml_backend_cuda_context {
+         if (cublas_handles[device][curr_stream_no] == nullptr) {
+             ggml_cuda_set_device(device);
+             CUBLAS_CHECK(cublasCreate(&cublas_handles[device][curr_stream_no]));
+-            CUBLAS_CHECK(cublasSetMathMode(cublas_handles[device][curr_stream_no], CUBLAS_TF32_TENSOR_OP_MATH));
++            // RMBG/InstantMesh: TF32 rounds FP32 operands to 10-bit mantissas and
++            // breaks the f32-parity gates (clip_vision 1.5e-3 / VAE encode 6e-2 vs
++            // the fp32 reference). Default to exact FMA math; opt back in with
++            // GGML_CUDA_TF32=1. f16/q8 tensor-core paths are unaffected either way,
++            // and on GeForce TF32 ran at the FP32 CUDA-core rate anyway, so this is
++            // performance-neutral there. Matches the Vulkan f32-matmul-exact default
++            // and the RMBG_CUDA_CONV_TF32 precedent.
++            static const bool cublas_tf32 = [] {
++                const char * o = std::getenv("GGML_CUDA_TF32");
++                return o && o[0] == '1';
++            }();
++            CUBLAS_CHECK(cublasSetMathMode(cublas_handles[device][curr_stream_no],
++                cublas_tf32 ? CUBLAS_TF32_TENSOR_OP_MATH : CUBLAS_DEFAULT_MATH));
+             CUBLAS_CHECK(cublasSetStream(cublas_handles[device][curr_stream_no], stream()));
+ #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && (CUBLAS_VER_MAJOR > 11 || (CUBLAS_VER_MAJOR == 11 && CUBLAS_VER_MINOR >= 2))
+             if (cublas_workspace_sizes[device] == 0) {

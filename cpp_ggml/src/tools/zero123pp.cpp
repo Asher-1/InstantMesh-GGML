@@ -207,6 +207,7 @@ int main(int argc, char ** argv) {
     const char * fixture_dir = nullptr;
     const char * dump_lat = nullptr;
     const char * dump_steps = nullptr;
+    const char * latents_in = nullptr;
     const char * device = "auto";
     int steps = 75;
     uint32_t seed = 42;
@@ -220,6 +221,7 @@ int main(int argc, char ** argv) {
         else if (arg("--unet"))        unet_path  = argv[++i];
         else if (arg("--vae"))         vae_path   = argv[++i];
         else if (arg("--fixture-dir")) fixture_dir = argv[++i];
+        else if (arg("--latents-in"))  latents_in  = argv[++i];
         else if (arg("--dump-final-latents")) dump_lat = argv[++i];
         else if (arg("--dump-steps")) dump_steps = argv[++i];
         else if (arg("--device"))      device     = argv[++i];
@@ -368,6 +370,12 @@ int main(int argc, char ** argv) {
     sched.set_alphas_cumprod(alphas.data(), (int) alphas.size());
     sched.set_timesteps(steps);
 
+    // CLIP/cond weights are done here: embeds are built into `context` (host)
+    // and every scheduler KV/pipeline constant was already read — dropping the
+    // 2.4GB GGUF buffer before the denoising loop lowers the diffusion-stage
+    // residency (the UNet is dropped later, before the VAE decode).
+    clip.gguf.unload();
+
     // ── denoising loop ─────────────────────────────────────────────────────
     const int H = 120, W = 80;                 // latents from height=960, width=640
     const int ref_h = 64, ref_w = 64;          // condition latent
@@ -387,12 +395,22 @@ int main(int argc, char ** argv) {
     const float init_sigma = sched.sigma(0);
     for (size_t k = 0; k < lat_n; ++k) latents[k] *= init_sigma;
 
+    // Debug: skip the denoising loop entirely and decode an externally supplied
+    // raw latents vector (e.g. the fixture ref_latents.bin) — isolates the VAE
+    // decode stage from the diffusion path.
+    if (latents_in) {
+        if (!read_blob(latents_in, latents, lat_n)) {
+            std::fprintf(stderr, "cannot read %s\n", latents_in); return 1;
+        }
+        std::printf("latents-in: skipped denoising loop\n");
+    }
+
     std::vector<float> scaled_in(lat_total), cond_noise((size_t) B * lat64),
                        noisy_cond((size_t) B * lat64), scaled_cond((size_t) B * lat64),
                        noise(lat_n), eps_buf(lat_total);
 
     const double t0 = now_s();
-    for (int i = 0; i < steps; ++i) {
+    for (int i = 0; !latents_in && i < steps; ++i) {
         const float t = sched.timesteps()[i];
         // r-pass input: cat([latents, latents]) then scale_model_input
         std::memcpy(scaled_in.data(), latents.data(), lat_n * sizeof(float));
@@ -470,6 +488,11 @@ int main(int argc, char ** argv) {
     }
 
     // ── postprocess: unscale_latents → VAE.decode → unscale_image → u8 ─────
+    // Free the UNet weights before decode (1.7GB f16 / 3.3GB f32): decode is
+    // the process VRAM peak stage and the UNet no longer participates
+    // (ALIGNMENT.md "12GB 卡 VRAM 预算"). No numerical effect.
+    unet.gguf.unload();
+
     if (dump_lat) {
         FILE * f = std::fopen(dump_lat, "wb");
         if (!f) { std::fprintf(stderr, "failed to open %s\n", dump_lat); return 1; }
@@ -484,12 +507,16 @@ int main(int argc, char ** argv) {
     if (!dec) { std::fprintf(stderr, "vae_decode failed\n"); return 1; }
     const int OH = dh, OW = dw;                       // 960 x 640
     std::vector<uint8_t> out_rgb((size_t) OH * OW * 3);
-    for (size_t k = 0; k < (size_t) OH * OW * 3; ++k) {
-        float v = dec[k] / 0.5f * 0.8f;               // unscale_image
-        v = v / 2.f + 0.5f;                           // postprocess denormalize
-        v = v < 0.f ? 0.f : (v > 1.f ? 1.f : v);
-        out_rgb[k] = (uint8_t) (v * 255.f + 0.5f);
-    }
+    // vae_decode returns torch [B,3,H,W] (channel-planes; see vae.cpp) — read
+    // with matching strides, not as interleaved HWC.
+    for (int c = 0; c < 3; ++c)
+        for (int y = 0; y < OH; ++y)
+            for (int x = 0; x < OW; ++x) {
+                float v = dec[((size_t) c * OH + y) * OW + x] / 0.5f * 0.8f; // unscale_image
+                v = v / 2.f + 0.5f;                       // postprocess denormalize
+                v = v < 0.f ? 0.f : (v > 1.f ? 1.f : v);
+                out_rgb[((size_t) y * OW + x) * 3 + c] = (uint8_t) (v * 255.f + 0.5f);
+            }
     free(dec);
 
     // ── split 3x2 grid into 6 views (run.py rearrange 'c (n h) (m w)') ────

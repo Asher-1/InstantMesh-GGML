@@ -58,6 +58,42 @@ static void u_mark(ggml_context * ctx, ggml_tensor * t, const std::string & nm) 
     }
 }
 
+// IM_UNET_PROBE: NaN-bisection probe for the denoising passes (same pattern
+// as the LRM probe, see docs/IM_LRM_PROBE.md).
+//   1 = per-call summary: one line per forward (75/step run => 75 lines)
+//       reporting nan/amax of both passes' eps tails (w_out / r_out).
+//   2 = stage taps: additionally registers every u_mark/dmark point (the
+//       IM_VAE_DUMP machinery) and prints per-tap nan/amax after compute.
+//       IM_DUMP_STAGES filters taps by name substring; IM_UNET_PROBE_T=<int>
+//       limits detailed taps to the call matching that timestep (a 75-step
+//       loop makes 150 calls — unfiltered detail floods output and the extra
+//       output tensors inflate peak memory). Without T only the first call is
+//       detailed. Run stage taps on CPU first: they block gallocr reuse and
+//       can OOM the 12GB Vulkan path.
+static int unet_probe_level() {
+    const char * p = std::getenv("IM_UNET_PROBE");
+    return p ? std::atoi(p) : 0;
+}
+static bool g_u_probe_detail_done = false;   // default: detail only on call #1
+static bool unet_probe_detail_ok(float timestep) {
+    const char * p = std::getenv("IM_UNET_PROBE_T");
+    if (p) return std::atoi(p) == (int) std::lround(timestep);
+    if (g_u_probe_detail_done) return false;
+    g_u_probe_detail_done = true;
+    return true;
+}
+static void unet_probe_report(const char * tag, ggml_tensor * t) {
+    const size_t n = ggml_nelements(t);
+    std::vector<float> buf(n);
+    ggml_backend_tensor_get(t, buf.data(), 0, n * sizeof(float));
+    long nan = 0; float amax = 0;
+    for (size_t i = 0; i < n; ++i) {
+        if (std::isnan(buf[i])) ++nan;
+        else if (std::fabs(buf[i]) > amax) amax = std::fabs(buf[i]);
+    }
+    std::printf("unet_probe %-14s nan=%ld/%zu amax=%g\n", tag, nan, n, amax);
+}
+
 // torch GroupNorm(G, eps) + affine on [W,H,C,B] contiguous, built from
 // explicit reductions. (The library ggml_group_norm computes this exact math
 // correctly in isolation but misbehaves inside the large UNet graph for
@@ -451,8 +487,10 @@ float * unet_forward_refonly(const UnetModel & m,
                                                   hp.cross_attention_dim, L, B);
     std::vector<ggml_tensor *> dumps;   // staged parity points
     std::vector<std::string> dump_nm;
+    const int probe = unet_probe_level();          // 0 off / 1 summary / 2 taps
+    const bool probe_detail = probe >= 2 && unet_probe_detail_ok(timestep);
     const bool dump = std::getenv("IM_VAE_DUMP") != nullptr;
-    g_u_dump = dump;
+    g_u_dump = dump || probe_detail;
     // graph first: dumps expand themselves as the passes are built
     g_u_gf = ggml_new_graph_custom(ctx, 65536, false);
     ggml_cgraph * gf = g_u_gf;
@@ -460,7 +498,7 @@ float * unet_forward_refonly(const UnetModel & m,
     ggml_tensor * temb = time_embedding(ctx, m, timestep, B, &emb_in); // [1280, B]
     u_mark(ctx, temb, "temb");
     auto dmark = [&](ggml_tensor * t, const char * nm) {
-        if (dump && g_u_stage_ok(nm)) {
+        if ((dump || probe_detail) && g_u_stage_ok(nm)) {
             ggml_tensor * d = ggml_cont(ctx, t);
             dumps.push_back(d); dump_nm.push_back(nm);
             ggml_build_forward_expand(gf, d);
@@ -564,6 +602,7 @@ float * unet_forward_refonly(const UnetModel & m,
 
     ggml_tensor * result_t = ggml_cont(ctx, r_out);
     ggml_set_output(result_t);
+    if (probe >= 1) ggml_set_output(w_out); // summary tap must survive compute
     for (size_t i = 0; i < dumps.size(); ++i) ggml_set_output(dumps[i]);
     for (size_t i = 0; i < g_u_dump_t.size(); ++i) ggml_set_output(g_u_dump_t[i]);
 
@@ -608,10 +647,23 @@ float * unet_forward_refonly(const UnetModel & m,
     ggml_backend_tensor_set(context_t, context, 0,
                             (size_t) B * hp.cross_attention_dim * L * sizeof(float));
     ggml_backend_graph_compute(m.backend, gf);
+    // IM_UNET_PROBE=1: one summary line per call — the two eps tails. This is
+    // the cheap "where does NaN start" sweep across the whole denoising loop.
+    if (probe >= 1) {
+        unet_probe_report("w.eps", w_out);
+        unet_probe_report("r.eps", result_t);
+        std::fflush(stdout);
+    }
     // gate: only flush stage dumps when IM_DUMP_T matches this call's timestep
     const char * dump_t = std::getenv("IM_DUMP_T");
     if (dump_t && std::atoi(dump_t) != (int) std::lround(timestep)) {
         g_u_dump_t.clear(); g_u_dump_nm.clear(); g_u_gn2_dump.clear();
+    } else if (probe_detail) {
+        // IM_UNET_PROBE=2: per-tap nan/amax over the stage dump points
+        // (dmarks carry explicit w./r. names; u_marks get the g_u_pass prefix).
+        for (size_t i = 0; i < dumps.size(); ++i) unet_probe_report(dump_nm[i].c_str(), dumps[i]);
+        for (size_t i = 0; i < g_u_dump_t.size(); ++i) unet_probe_report(g_u_dump_nm[i].c_str(), g_u_dump_t[i]);
+        std::fflush(stdout);
     } else
     for (size_t i = 0; i < dumps.size(); ++i) {
         const size_t n = ggml_nelements(dumps[i]);
@@ -620,7 +672,7 @@ float * unet_forward_refonly(const UnetModel & m,
         char fn[128]; std::snprintf(fn, sizeof(fn), "/tmp/unet_%s.bin", dump_nm[i].c_str());
         FILE * f = std::fopen(fn, "wb"); std::fwrite(buf.data(), 4, n, f); std::fclose(f);
     }
-    for (size_t i = 0; i < g_u_dump_t.size(); ++i) {
+    for (size_t i = 0; i < g_u_dump_t.size() && !probe_detail; ++i) {
         const size_t n = ggml_nelements(g_u_dump_t[i]);
         std::vector<float> buf(n);
         ggml_backend_tensor_get(g_u_dump_t[i], buf.data(), 0, n * sizeof(float));

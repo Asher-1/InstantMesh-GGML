@@ -118,7 +118,73 @@ softmax 饱和和 LayerNorm 能把中间的垃圾数据掩盖掉。f32 显示"�
 | 变量 | 作用 |
 |---|---|
 | `IM_LRM_PROBE=1` | 开启 lrm_transformer 的 NaN 探针 |
+| `IM_UNET_PROBE=1` | UNet 每次前向一行 summary（w/r eps 的 nan/amax） |
+| `IM_UNET_PROBE=2` | UNet 额外注册全部 stage tap 并逐 tap 打印 |
+| `IM_UNET_PROBE_T=<int>` | UNet stage tap 仅在匹配 timestep 的 call 打印 |
+| `IM_DUMP_STAGES=<substr>` | UNet stage tap 名称子串过滤（与 probe=2 组合） |
 
-同类模型（dino、synthesizer、unet 等）出现 NaN 时，可复制这套 sink +
-`probe_register` + 单次 compute + 统一读取的模式，建议沿用 `IM_<MODEL>_PROBE`
-的命名。
+## 5. zero123pp UNet 探针（IM_UNET_PROBE）
+
+扩散模型与 LRM 的调用模式不同：UNet 每个去噪步调用一次前向（w/r 两个 pass
+在同一张图里），75 步 = 150 个 pass / 75 次 compute。探针据此做了两级设计
+（实现于 `src/models/unet.cpp`，复用 `IM_VAE_DUMP` 的 tap 基础设施）：
+
+### 用法一：全流程 summary 扫描（`=1`）
+
+```bash
+IM_UNET_PROBE=1 ./build-gpu/zero123pp --image ../examples/blue_cat.png \
+    --device cpu --steps 75 --seed 42 2>&1 | grep unet_probe
+```
+
+每个 call 打印一行对：
+
+```text
+unet_probe w.eps          nan=0/32768 amax=4.77203    # w-pass eps（cond 尺度）
+unet_probe r.eps          nan=0/76800 amax=0.842033   # r-pass eps（去噪尺度）
+```
+
+75 行一眼看出 NaN 从哪个 timestep 开始出现。若 `amax` 逐步异常增长也
+值得关注（数值发散通常先于 NaN）。
+
+### 用法二：单步 stage 二分（`=2`）
+
+summary 定位到起始 timestep 后，用 `IM_UNET_PROBE_T` 锁定该步看内部 tap：
+
+```bash
+IM_UNET_PROBE=2 IM_UNET_PROBE_T=979 IM_DUMP_STAGES=d0 \
+    ./build-gpu/zero123pp --device cpu --steps 75 --seed 42
+```
+
+tap 覆盖两类点（名字与 `IM_VAE_DUMP` 一致）：
+
+- **dmark 主干**：`w.conv_in` / `w.d0.r0` / `w.d0.attn0` / ... / `w.mid` /
+  `wup0.upc` / `w.conv_out`（r-pass 同名前缀 `r.`）——resblock/attention
+  输出与上采样链，定位第一个异常 block。
+- **u_mark 内部**：`*.norm1` / `*.silu1` / `*.conv1` / `*.te` / `*.gn2_bare`
+  / `*.norm2` / `*.conv2`（resnet 内部）与 `*.tgn` / `*.tgather` / `*.tproj`
+  （transformer 内部）——定位 block 内确切算子。
+
+`IM_DUMP_STAGES` 子串过滤可缩小打印量（如 `IM_DUMP_STAGES=mid` 只看
+mid_block 相关 tap）。
+
+### 与 LRM 探针的差异（重要）
+
+| 事项 | LRM（单次调用） | UNet（150 次调用） |
+|---|---|---|
+| 详细 tap gate | 不需要 | `IM_UNET_PROBE_T`（默认仅第 1 个 call 详细） |
+| tap 实现 | `ggml_set_output` 标记原节点 | 复用 `IM_VAE_DUMP` 的 `ggml_cont` 拷贝立即 expand |
+| 内存开销 | output 阻止复用，一次性 | 拷贝增加峰值内存，75 步循环会累积 |
+
+两个 UNet 特有注意点：
+
+1. **默认只详细打印第一个 call**（未设 `IM_UNET_PROBE_T` 时）。NaN 若在
+   后期 step 才出现，务必用 `IM_UNET_PROBE_T=<该步 timestep>` 锁定。
+2. **stage tap 优先在 CPU 上跑**：每个 tap 是一份 `ggml_cont` 拷贝，
+   ~50 个 tap 增加数百 MB 峰值内存；12GB Vulkan 路径的 VAE decode 本就
+   临近 OOM，全 tap 可能直接爆显存。summary 模式（`=1`）只给图尾
+   `set_output`，开销可忽略，GPU 上可用。
+
+### 验证记录（2026-09-18）
+
+- `IM_UNET_PROBE=1/2` 2 步短跑输出正常，全 tap `nan=0`、amax 合理。
+- probe1/probe2 的最终 latents 与不带探针 **bit-exact**——探针对数值零影响。

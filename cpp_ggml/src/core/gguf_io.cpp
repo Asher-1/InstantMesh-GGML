@@ -9,8 +9,17 @@
 namespace instantmesh {
 
 GgufModel::~GgufModel() {
+    unload();
+}
+
+void GgufModel::unload() {
+    if (buffer) ggml_backend_buffer_free(buffer);
+    buffer = nullptr;
     if (gguf) gguf_free(gguf);
-    if (ctx)  ggml_free(ctx);
+    gguf = nullptr;
+    if (ctx) ggml_free(ctx);
+    ctx = nullptr;
+    tensors.clear();
 }
 
 uint32_t kv_u32(const gguf_context * g, const char * key, uint32_t def) {
@@ -85,7 +94,8 @@ bool load_gguf(const std::string & path, ggml_backend_t backend,
     }
 
     // Allocate every tensor on the chosen backend (single buffer).
-    if (ggml_backend_alloc_ctx_tensors(out.ctx, backend) == nullptr) {
+    out.buffer = ggml_backend_alloc_ctx_tensors(out.ctx, backend);
+    if (out.buffer == nullptr) {
         if (error) *error = "ggml_backend_alloc_ctx_tensors failed: " + path;
         return false;
     }

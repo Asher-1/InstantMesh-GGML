@@ -280,6 +280,10 @@ int main(int argc, char ** argv) {
                                                    V, IMG, IMG, &seq, &hidden);
     const double t_dino = now_s();
     std::printf("dino output: [%d, %d, %d]\n", V, seq, hidden);
+    // DINO weights are done here (feats already in host memory) — drop them
+    // before the synthesizer stage, the pipeline's VRAM peak, and keep the
+    // resident set minimal on 12GB cards (ALIGNMENT.md "12GB 卡 VRAM 预算").
+    dino.gguf.unload();
 
     // ---- Stage 2: TriplaneTransformer ------------------------------------
     int n_planes = 0, p_dim = 0, pH = 0, pW = 0;
@@ -288,6 +292,8 @@ int main(int argc, char ** argv) {
     const double t_trans = now_s();
     std::printf("planes: [1, %d, %d, %d, %d]\n", n_planes, p_dim, pH, pW);
     std::free(image_feats);
+    // TriplaneTransformer weights are done too — same rationale as above.
+    trans.gguf.unload();
 
     if (dump_planes_path) {
         FILE * f = std::fopen(dump_planes_path, "wb");

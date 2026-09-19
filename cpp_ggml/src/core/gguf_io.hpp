@@ -22,10 +22,17 @@ namespace instantmesh {
 struct GgufModel {
     gguf_context * gguf = nullptr;
     ggml_context * ctx  = nullptr;
+    // backend buffer holding the streamed weights (freed in unload()).
+    ggml_backend_buffer_t buffer = nullptr;
     // name -> tensor (built once at load for O(1) graph wiring later).
     std::unordered_map<std::string, ggml_tensor *> tensors;
 
     ~GgufModel();
+    // Release the weight buffer + metadata early while the object stays alive
+    // (tensor map is cleared; the model must not be used afterwards). Lets a
+    // pipeline drop stages whose weights are no longer needed — e.g. the
+    // zero123pp UNet/CLIP before the VAE decode — to cut the VRAM peak.
+    void unload();
 };
 
 // KV readers with defaults (return `def` if the key is absent).

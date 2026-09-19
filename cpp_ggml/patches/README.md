@@ -20,6 +20,7 @@ official sources from `git submodule update --init`. Therefore:
 | Patch | Content | Baseline |
 |---|---|---|
 | `ggml-rmbg-ops.patch` | ggml custom ops required by the rembg/BiRefNet foreground segmentation (RMBG-2.0) port: `GGML_MAX_NAME` 64→128, CUDA kernels (deform-im2col / affine-relu / gather / swin-qkv-layout / swin-windows) with matching Vulkan shaders, plus shader-generator registration. Also carries three explicit ggml-vulkan precision APIs (see below) and an `IM_GN_DEBUG`-gated debug print in `src/ggml-cpu/ops.cpp` group-norm (used during UNet parity debugging). | Official v0.21.0 (`8599e0ea`) |
+| `ggml-cuda-f32-matmul-exact.patch` | cuBLAS math mode defaults to exact FMA (`CUBLAS_DEFAULT_MATH`) instead of unconditional `CUBLAS_TF32_TENSOR_OP_MATH`; `GGML_CUDA_TF32=1` opts back in. Fixes the CUDA twin of the Vulkan f32-matmul-stages-through-F16 trap: TF32 rounded FP32 operands to 10-bit mantissas, failing parity gates (`test_clip_vision` 1.5e-3, `test_vae` encode 6e-2 vs CPU ~1e-6/1e-4). f16/q8 tensor-core paths unaffected; on GeForce TF32 ran at the FP32 CUDA-core rate, so performance is unchanged. | Official v0.21.0 (`8599e0ea`) |
 
 > History:
 > - The flash-attn head_dim=64 issue (v0.18.0) was fixed upstream in v0.18.1; resolved
