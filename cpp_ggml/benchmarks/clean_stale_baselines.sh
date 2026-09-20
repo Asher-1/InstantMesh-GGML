@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Remove stale baselines superseded by the refreshed baseline set
 # (benchmarks/results/{img}__{backend}__{prec}.{sdf.bin,obj} @ .rev sidecars,
-# see docs/ALIGNMENT.md "回归基线管理规范" 基线台账).
+# see docs/ALIGNMENT.md "Regression baseline management" ledger).
 #
 #   usage: bash benchmarks/clean_stale_baselines.sh [--dry-run]
 #

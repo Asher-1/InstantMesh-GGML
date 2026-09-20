@@ -26,7 +26,7 @@ Technical decisions (confirmed):
 - ✅ Weights `models/gguf/rmbg_{f32,f16,q8}.gguf` (same source as the trellis project;
   its parity already verified).
 
-## Phase 1: Zero123++ Multi-View Diffusion (UNet + pipeline 已收敛，剩 E2E 验收)
+## Phase 1: Zero123++ Multi-View Diffusion (UNet + pipeline converged; E2E acceptance remains)
 
 Completed components (each gated by a ctest parity test; tests SKIP (77) when
 fixtures are absent):
@@ -134,8 +134,8 @@ against in-process naive references):
 
 Actual root causes of the old divergence, in the order they were found:
 
-1. **gallocr reuse corrupted the staged dumps** (the historical "galloc 复用
-   干扰"): a tensor is recycled once its *direct* consumers ran (NOT
+1. **gallocr reuse corrupted the staged dumps** (the historical "galloc reuse
+   interference"): a tensor is recycled once its *direct* consumers ran (NOT
    transitive), so consumer-less dump tensors were overwritten by later
    activations. Fix: every post-compute-read tensor is marked
    `ggml_set_output()` (ggml-alloc.c: "graph outputs are never freed").
@@ -174,67 +174,84 @@ and the asymmetric downsample above. `IM_VAE_DUMP=1` triggers the dumps.
       `test_clip_vision` 7.6e-6, `test_unet` f32 7.1e-4 / f16 8.8e-4).
 - [~] CUDA / Vulkan / CPU backend consistency: the same components run on each backend
       against the same torch fixtures (device via test argv[1]). Status 2026-09-18:
-      CPU 全绿；CUDA 需 `NVIDIA_TF32_OVERRIDE=0`（clip 1.5e-3→1.2e-5），UNet 修复
-      GEGLU 非连续输入后 9.4e-4。Vulkan 的两个 f16 陷阱已定位并在模型侧修复
-      （见下 "Vulkan f16 traps"），CLIP 逐层回归全部 stage 降到 torch fp32 自身
-      舍入水平：patch conv 2.1e-4→1.0e-6、attn_raw 1.8e-4→5.5e-6、端到端
-      embeds 1.5e-3→**4.2e-6**（优于 CPU 7.6e-6）。zero123pp 完整 75 步 E2E
-      （blue_cat，f16 UNet/VAE，seed 42，真实图像无 fixture）：Vulkan 长跑需
-      关 device fp16——现由显式参数 `BackendInitOptions::vulkan_fp16`（默认
-      false，`init_best_backend` 经 `ggml_backend_vk_set_fp16` 在设备创建前
-      应用）内建，无需任何 env；f32 matmul 精确路由同样由显式 API 内建，
-      coopmat 可保持开启服务 f16/量化 matmul。vs CPU 最终 latents max_abs
-      2.3e-2 / mean 5.2e-4（PSNR 70.6dB）、grid PSNR **54.9dB**（视觉不可分
-      辨；残余为 150 次 double-forward 的逐 op fp32 舍入累积）。注意：device
-      fp16 开启时，f16 权重 matmul 的激活 f16 暂存误差随采样步数累积——
-      8 步短跑仅 latents 7.2e-3 / grid 53.4dB，75 步全跑恶化到 latents mean
-      1.9e-2 / grid 28.8dB，**长跑必须关 device fp16**。VAE encode 的 GPU
-      阈值仍需按 re-rounding 预期放宽或逐 op 收紧。
+      CPU all green; CUDA needed `NVIDIA_TF32_OVERRIDE=0` (clip 1.5e-3→1.2e-5); UNet
+      fixed for the GEGLU non-contiguous input, now 9.4e-4. Vulkan's two f16 traps
+      located and fixed model-side (see "Vulkan f16 traps" below); CLIP per-layer
+      regression brought every stage down to torch fp32's own rounding level:
+      patch conv 2.1e-4→1.0e-6, attn_raw 1.8e-4→5.5e-6, end-to-end embeds
+      1.5e-3→**4.2e-6** (better than CPU's 7.6e-6). zero123pp full 75-step E2E
+      (blue_cat, f16 UNet/VAE, seed 42, real image no fixture): Vulkan long runs
+      need device fp16 off — now built in via the explicit parameter
+      `BackendInitOptions::vulkan_fp16` (default false, `init_best_backend`
+      applies it through `ggml_backend_vk_set_fp16` before device creation), no
+      env needed; exact f32-matmul routing is likewise built in via an explicit
+      API, coopmat stays on serving f16/quantized matmuls. Final latents vs CPU
+      max_abs 2.3e-2 / mean 5.2e-4 (PSNR 70.6dB), grid PSNR **54.9dB** (visually
+      indistinguishable; the residual is per-op fp32 rounding accumulated over
+      150 double-forwards). Note: with device fp16 on, the activation fp16
+      staging error of f16-weight matmuls accumulates over sampling steps —
+      an 8-step short run is only latents 7.2e-3 / grid 53.4dB, but the full
+      75 steps degrade to latents mean 1.9e-2 / grid 28.8dB; **long runs must
+      keep device fp16 off**. The GPU acceptance threshold for VAE encode still
+      needs relaxing per the expected re-rounding, or tightening op by op.
 
-  更新 2026-09-19（探针加持下的 Vulkan 完整 E2E + f16/f32 双路径验收）:
-  - **完整流程含 VAE decode 全绿**：VRAM 空闲（无桌面程序占用）时 Vulkan f16
-    75 步全流程 162.9s，VAE decode + 6 视图 PNG + grid 全部产出——此前
-    VAE decode OOM 纯因桌面程序（ACloudViewer ~3GB）挤占显存，非代码回归。
-    跑 GPU 回归前先 `nvidia-smi` 确认空闲（见下 "12GB 卡 VRAM 预算"）。
-  - **NaN 探针零数值影响（E2E 级二次确认）**：`IM_UNET_PROBE=1` 全程开启下
-    Vulkan f16 latents vs CPU f16 = max **2.286e-2** / mean **5.196e-4**，
-    与 9-18 无探针基线（2.3e-2/5.2e-4）一致；2 步短跑 probe1/probe2 latents
-    与无探针 bit-exact。探针用法见 `docs/IM_LRM_PROBE.md`（LRM 单次前向用
-    `IM_LRM_PROBE`；扩散长跑用 `IM_UNET_PROBE=1` 监测每步 w/r eps 的
-    nan/amax，发散时 `=2 + IM_UNET_PROBE_T=<timestep>` 二分到 block/算子）。
-  - **f16/f32 双路径**：Vulkan f32 75 步 latents vs CPU f16 = max 1.955e-2 /
-    mean 5.359e-4；Vulkan f16 vs f32 互差 1.306e-2 / 5.334e-4——两条路径均
-    稳定在 fp32 舍入水平，f32 权重未带来额外退化。75 步全程 nan=0，amax
-    平稳无发散（w.eps 4.77→2.15 递减，r.eps 0.84→2.71 缓增）。
-    f32 75 步**完整流程（含 VAE decode）在 unload 优化后亦通过**：
-    186.5s、0 OOM、6 视图 PNG 全出，且最终 latents 与优化前 f32 75 步
-    **bit-exact**（unload 数值无关性的 75 步级确认）。
-  - **flexicubes 防御改动等价性（三重验证）**：`unique_pairs` 的
-    `empty()` → `size() < 2`（消除"成对 push 尺寸恒偶"隐式不变式依赖）在
-    CPU f32、CPU f16 均 bit-exact；Vulkan f16 经 stash 对照实验（只回退该行
-    重编重跑）bit-exact 证实等价。注意：跨代码版本重编（如 models/*.o 的
-    无关改动触发重编）会使 Vulkan 几何管线 SDF 整体微移（9-18 vs 9-19
-    max 1.4，100% 元素级）——见下 "回归基线管理规范"。
+  Update 2026-09-19 (Vulkan full E2E + f16/f32 dual-path acceptance with probes):
+  - **Full chain including VAE decode all green**: with VRAM free (no desktop app
+    holding memory) the Vulkan f16 75-step full run took 162.9s, producing VAE
+    decode + 6 view PNGs + grid — the earlier VAE decode OOM was purely a desktop
+    app (ACloudViewer ~3GB) squeezing VRAM, not a code regression. Check
+    `nvidia-smi` for free VRAM before GPU regressions (see "12GB VRAM budget" below).
+  - **NaN probe has zero numerical impact (E2E-level re-confirmation)**: with
+    `IM_UNET_PROBE=1` on throughout, Vulkan f16 latents vs CPU f16 = max
+    **2.286e-2** / mean **5.196e-4**, matching the 9-18 no-probe baseline
+    (2.3e-2/5.2e-4); 2-step short runs with probe1/probe2 are bit-exact with the
+    no-probe run. Probe usage in `docs/IM_LRM_PROBE.md` (`IM_LRM_PROBE` for LRM's
+    single forward; `IM_UNET_PROBE=1` for long diffusion runs to monitor each
+    step's w/r eps nan/amax; on divergence `=2 + IM_UNET_PROBE_T=<timestep>`
+    bisects down to block/op).
+  - **f16/f32 dual paths**: Vulkan f32 75-step latents vs CPU f16 = max 1.955e-2 /
+    mean 5.359e-4; Vulkan f16 vs f32 mutual difference 1.306e-2 / 5.334e-4 — both
+    paths are stable at fp32 rounding level, f32 weights bring no extra
+    degradation. nan=0 throughout all 75 steps, amax stable with no divergence
+    (w.eps 4.77→2.15 decreasing, r.eps 0.84→2.71 slowly rising).
+    The f32 75-step **full chain (incl. VAE decode) also passes after the unload
+    optimization**: 186.5s, 0 OOM, all 6 view PNGs produced, and the final
+    latents are **bit-exact** with the pre-optimization f32 75-step run
+    (75-step-level confirmation of unload's numerical neutrality).
+  - **flexicubes defensive change equivalence (triple verification)**:
+    `unique_pairs`' `empty()` → `size() < 2` (removing the implicit invariant
+    that paired pushes keep the size even) is bit-exact on CPU f32 and CPU f16;
+    Vulkan f16 verified equivalent via a stash experiment (revert just that
+    line, rebuild, rerun, compare). Note: cross-version rebuilds (e.g.
+    unrelated `models/*.o` changes such as the lrm_transformer probe refactor)
+    cause a small global shift in the Vulkan geometry pipeline's SDF (9-18 vs
+    9-19: max 1.4, 100% of elements) — see "Regression baseline management" below.
 
-  Vulkan f16 traps（根因与规避，均已验证）:
-  1. **f32 matmul shader 以 f16 暂存**：所有 `matmul_f32_*` SPIR-V 变体
-     （coopmat `_cm1` 与 fp16 编译的 scalar 中间分支）的 `FLOAT_TYPE=float16_t`
-     在构建期由 vulkan-shaders-gen 嵌死，运行时开关只能整支切换。只有
-     `!coopmat && !fp16` 分支用的 `_fp32` 变体是真 fp32。规避：patch 提供
-     显式 API `ggml_backend_vk_set_f32_matmul_exact(bool)`（默认 true），
-     F32×F32→F32 matmul 一律路由到真 fp32 scalar pipeline；f16/量化 matmul
-     不受影响，永远走 coopmat/tensor core；设 false 可换回性能。生产路径的
-     fp16 开关已全部收敛为显式参数：InstantMesh 经
-     `BackendInitOptions::vulkan_fp16`（显式 API `ggml_backend_vk_set_fp16`，
-     `init_best_backend` 在设备创建前应用），RMBG 经 env（设备创建期读取，
-     待后续收敛）；env `GGML_VK_DISABLE_F16` 仍受支持并与显式参数相与，仅作
-     诊断逃生口。实测最小复现 mul_mat 4.6e-3→1.8e-5。
-  2. **非连续 matmul 操作数被隐式转 F16**：`ggml_vk_mul_mat_q_f16` 对未通过
-     `ggml_vk_dim01_contiguous` 的 x/y 操作数先 `cpy → F16` 再派发，f32 数据
-     被静默舍入（per-head strided view、未 cont 的 reshape+permute 都会踩中，
-     典型症状：attention 输出单层 ~1e-4 而非 ~1e-6）。规避：一切 matmul
-     操作数用 `ggml_cont` 物化（clip_vision 的 `qr`、unet 的 `qh/kh`、dino
-     的 `to_head` 已统一处理）。
+  Vulkan f16 traps (root causes and mitigations, all verified):
+  1. **f32 matmul shader stages through f16**: every `matmul_f32_*` SPIR-V
+     variant (the coopmat `_cm1` and the fp16-compiled scalar intermediate
+     branch) has `FLOAT_TYPE=float16_t` baked in at build time by
+     vulkan-shaders-gen; runtime switches can only swap the whole branch. Only
+     the `_fp32` variants used by the `!coopmat && !fp16` branch are true fp32.
+     Mitigation: the patch provides the explicit API
+     `ggml_backend_vk_set_f32_matmul_exact(bool)` (default true); all
+     F32×F32→F32 matmuls are routed to the true fp32 scalar pipeline; f16/
+     quantized matmuls are unaffected and always use coopmat/tensor cores;
+     set false to trade accuracy for speed. The fp16 switches in production
+     paths have all converged to explicit parameters: InstantMesh via
+     `BackendInitOptions::vulkan_fp16` (explicit API `ggml_backend_vk_set_fp16`,
+     applied by `init_best_backend` before device creation), RMBG via env (read
+     during device creation, to be converged later); the `GGML_VK_DISABLE_F16`
+     env is still supported and ANDs with the explicit parameter, as a
+     diagnostic escape hatch. Measured minimal reproduction: mul_mat
+     4.6e-3→1.8e-5.
+  2. **Non-contiguous matmul operands are implicitly converted to F16**:
+     `ggml_vk_mul_mat_q_f16` first does `cpy → F16` on x/y operands that fail
+     `ggml_vk_dim01_contiguous`, silently rounding f32 data (per-head strided
+     views, un-materialized reshape+permute both hit this; typical symptom: a
+     single attention output at ~1e-4 instead of ~1e-6). Mitigation: materialize
+     every matmul operand with `ggml_cont` (clip_vision's `qr`, unet's `qh/kh`,
+     dino's `to_head` are all handled).
 - [ ] `instantmesh --image x.png --rmbg rmbg.gguf` (after rembg and Zero123++ are in)
       produces the same mesh as `python run.py` for the same input (same bridged
       baseline).
@@ -242,196 +259,235 @@ and the asymmetric downsample above. `IM_VAE_DUMP=1` triggers the dumps.
       parity.
 - [ ] `--save-video` outputs the frame sequence.
 
-## 12GB 卡 VRAM 预算（哪些路径只能跑 f16）
+## 12GB VRAM budget (which paths are f16-only)
 
-实测于 RTX 3060 12GB（驱动分配 + ggml 单块 buffer 约束，gallocr 的
-`reserve` 要求整块连续 buffer，峰值取决于**最大单个 buffer**而非总占用）：
+Measured on RTX 3060 12GB (driver allocation + the ggml single-buffer
+constraint: gallocr's `reserve` requires one contiguous block, so the peak is
+governed by the **largest single buffer**, not total usage):
 
-| 管线阶段 | f16 ggml 单块请求 | f32 ggml 单块请求 | 12GB 卡结论 |
+| Pipeline stage | f16 ggml single-block request | f32 ggml single-block request | 12GB verdict |
 |---|---|---|---|
-| zero123pp UNet 75 步 | ~2GB | ~4GB | f16/f32 均可 |
-| zero123pp VAE decode | ~1.4GB | **6.25GB**（2.83GB 分配失败实测） | **unload 优化前 f32 必 OOM；优化后 f32 可跑（已实测出图）** |
-| instantmesh 几何管线（synthesizer） | ~4.7GB | 未测（预期 >6GB） | f16 可用；f32 建议直接 CPU |
-| rembg（RMBG） | 小 | 小 | f16/f32 均可 |
+| zero123pp UNet 75 steps | ~2GB | ~4GB | f16/f32 both fine |
+| zero123pp VAE decode | ~1.4GB | **6.25GB** (2.83GB allocation failure measured) | **f32 always OOM before the unload optimization; f32 runs after it (image output verified)** |
+| instantmesh geometry (synthesizer) | ~4.7GB | unmeasured (expected >6GB) | f16 usable; f32 recommend CPU |
+| rembg (RMBG) | small | small | f16/f32 both fine |
 
-**两个口径，别混淆**（2026-09-19 `nvidia-smi` 0.3-0.5s 采样实测，zero123pp
-4 步短跑，idle ~1.3GB）：
-- 上表"ggml 单块请求"= gallocr reserve 的**单个连续 buffer**大小（OOM 报错
-  里的数字），不代表进程总占用；
-- **进程总驻留**（nvidia-smi `memory.used` 口径，unload 优化前）：扩散稳定
-  期 ~7.0GB，**VAE decode 阶段冲到 11593 MiB（全流程峰值）**；
-- **`GgufModel::unload()` 优化后（同日重测）：全流程峰值降到
-  8192 MiB（-3.4GB）**，扩散阶段不变（权重仍在用），VAE decode 阶段
-  因 UNet/CLIP 权重已释放不再冲顶；
-- 12GB 卡 f16 余量从 ~0.6GB 提升到 **~4GB**；**f32 全权重 E2E 因此修复**：
-  unload 后 f32 VAE decode（6.25GB 单块）分配成功，4 步短跑完整出图
-  （0 OOM，11.9s）——下表"只能 f16"的旧结论已被优化推翻。
-- **f32 优化后峰值 ~9.2GB（9161 MiB，0.5s 采样全程日志，同环境同 idle）**，
-  出现在 f32 UNet 扩散阶段（3.3GB 权重 + ~4GB 激活单块）；VAE decode 阶段
-  （6.25GB 单块）因权重已释放不再冲顶。**f32 余量 ~3GB**（f16 ~4GB）：
-  f32 路径 batch 翻倍会同时把 UNet 激活单块与 VAE decode 单块推过 12GB，
-  不可行；f16 路径 batch=2 尚有余量但需实测确认。
+**Two units of measure, do not conflate** (2026-09-19 `nvidia-smi` 0.3-0.5s
+sampling, zero123pp 4-step short run, idle ~1.3GB):
+- The table's "ggml single-block request" = the size of the **single contiguous
+  buffer** reserved by gallocr (the number in OOM errors), not the process
+  total;
+- **Process residency** (nvidia-smi `memory.used`, before the unload
+  optimization): ~7.0GB during stable diffusion, **peaking at 11593 MiB during
+  VAE decode (whole-run peak)**;
+- **After the `GgufModel::unload()` optimization (re-measured same day):
+  whole-run peak down to 8192 MiB (-3.4GB)**; the diffusion stage is unchanged
+  (weights still in use), and the VAE decode stage no longer peaks because
+  UNet/CLIP weights are released;
+- 12GB f16 headroom grows from ~0.6GB to **~4GB**; **the full-f32 E2E is fixed
+  accordingly**: after unload the f32 VAE decode (6.25GB single block)
+  allocates successfully and the 4-step short run produces a full image
+  (0 OOM, 11.9s) — the old "f16-only" conclusion below is overturned.
+- **f32 post-fix peak ~9.2GB (9161 MiB, 0.5s sampling over the whole run, same
+  environment and idle)**, occurring in the f32 UNet diffusion stage (3.3GB
+  weights + ~4GB activation block); the VAE decode stage (6.25GB single block)
+  no longer peaks since those weights are released. **f32 headroom ~3GB** (f16
+  ~4GB): doubling the f32 batch pushes both the UNet activation block and the
+  VAE decode block past 12GB — not feasible; f16 batch=2 has headroom but
+  needs measurement.
 
-规则与经验：
-1. **12GB 卡上 zero123pp 的 f32 全权重 E2E**——`GgufModel::unload()` 优化前
-   latents 能算完但 VAE decode 必 OOM；**优化后已修复**（f32 4 步短跑完整
-   出图，0 OOM）。75 步 f32 完整流程同理可用，无需再退回 CPU 出图。
-2. **外部显存占用是隐形杀手**：桌面程序（如 ACloudViewer ~3GB）常驻会使
-   本来够用的 f16 VAE decode（1.4GB 连续分配）也 OOM。跑 GPU 回归前先
+Rules and lessons:
+1. **zero123pp full-f32 E2E on a 12GB card** — before `GgufModel::unload()`
+   the latents computed but VAE decode always OOM'd; **fixed after the
+   optimization** (f32 4-step short run produces a full image, 0 OOM). The
+   f32 75-step full chain works the same way; no need to fall back to CPU
+   for image output.
+2. **External VRAM usage is the invisible killer**: a resident desktop app
+   (e.g. ACloudViewer ~3GB) OOMs even the comfortably-sized f16 VAE decode
+   (1.4GB contiguous). Before GPU regressions check
    `nvidia-smi --query-gpu=memory.used,memory.total --format=csv,noheader`
-   确认空闲，并用 `nvidia-smi --query-compute-apps=pid,used_memory` 排查残留。
-3. GPU 任务**不要并发**：zero123pp 75 步运行中再起 instantmesh（synthesizer
-   需 4.7GB）会 OOM。GPU 回归一律串行；CPU 任务可与 GPU 并行互不干扰。
+   and inspect leftovers with `nvidia-smi --query-compute-apps=pid,used_memory`.
+3. **Do not run GPU tasks concurrently**: launching instantmesh while
+   zero123pp's 75 steps run (synthesizer needs 4.7GB) OOMs. GPU regressions
+   are strictly serial; CPU tasks can run alongside GPU freely.
 
-## 回归基线管理规范（同版本基线原则）
+## Regression baseline management (same-version principle)
 
-**背景**：2026-09-19 发现，跨代码版本对比 Vulkan 几何管线 SDF 会得到
-"100% 元素差异、max 1.4"的假回归——根因是 `models/*.o`（如 lrm_transformer
-探针重构）等**与被测逻辑无关的编译单元**重编后，GPU 数值路径发生整体微移
-（fp32 舍入级逐 op 累积，最终 stats 可分辨但视觉不可分）。CPU 路径不受此
-影响（同输入 bit-exact）。
+**Background**: on 2026-09-19, comparing the Vulkan geometry pipeline's SDF
+across code versions produced a false regression of "100% element difference,
+max 1.4" — the cause is that unrelated translation units (`models/*.o`, e.g.
+the lrm_transformer probe refactor) recompiled, shifting the GPU numeric path
+as a whole (fp32-rounding-level per-op accumulation; final stats
+distinguishable, visually not). CPU paths are immune (bit-exact same input).
 
-**规范**：
-1. **同版本原则**：误差对比（bit-exact / max / PSNR）的两侧必须由**同一份
-   源码同一编译产物**生成。基线文件（`benchmarks/results/*.sdf.bin` 等）
-   更新时必须记录生成它的 commit hash，建议存 sidecar 文件
-   （如 `blue_cat__vulkan__f16.sdf.bin.rev` 写入 `git rev-parse HEAD`）。
-2. **改动等价性验证的正确姿势**：证明某改动不改变数值，用
-   `git stash push -- <该文件>` → 重编 → 重跑 → 与改动版输出对比
-   bit-exact → `git stash pop` → 重编恢复。**不要**拿旧日期的基线文件对比
-   新编译产物。
-3. **基线刷新流程**：代码变更合入后，若有意接受新的数值路径（如编译单元
-   变化导致的微移），重跑该后端全部精度组合刷新基线并更新 commit hash
-   sidecar；刷新后在 ALIGNMENT.md 记录一行（日期 + 变更原因 + 新基线数值）。
-4. **跨版本 diff 的判读**：新二进制 vs 旧基线出现"大量元素小差异 +
-   少量大差异"时，先怀疑基线过期（编译单元微移），再做 stash 对照实验
-   归因，不要直接当回归修。
-5. **运行间确定性**：同二进制同后端重复运行应 bit-exact（Vulkan/CPU 已
-   验证）。若同一二进制两次运行都不一致，先查非确定性来源（线程数、
-   env、GPU 状态），再谈精度。
+**Rules**:
+1. **Same-version principle**: both sides of any error comparison
+   (bit-exact / max / PSNR) must come from the **same source and same build
+   artifacts**. When baseline files (`benchmarks/results/*.sdf.bin` etc.) are
+   refreshed, record the generating commit hash, ideally as a sidecar file
+   (e.g. `blue_cat__vulkan__f16.sdf.bin.rev` containing `git rev-parse HEAD`).
+2. **Correct way to prove a change is numerically neutral**:
+   `git stash push -- <file>` → rebuild → rerun → compare with the modified
+   version's output bit-exact → `git stash pop` → rebuild back. **Never**
+   compare an old-dated baseline file against a new build.
+3. **Baseline refresh flow**: after a change lands that intentionally accepts a
+   new numeric path (e.g. compilation-unit drift), re-run all precision
+   combinations of that backend to refresh baselines and update the commit
+   hash sidecar; record one line in ALIGNMENT.md (date + reason + new numbers).
+4. **Interpreting cross-version diffs**: when a new binary vs an old baseline
+   shows "many small differences + a few large ones", first suspect a stale
+   baseline (compilation-unit drift), then run the stash experiment to
+   attribute — do not treat it as a regression to fix.
+5. **Run-to-run determinism**: the same binary on the same backend must be
+   bit-exact across runs (verified for Vulkan/CPU). If the same binary
+   disagrees with itself, look for non-determinism sources (threads, env, GPU
+   state) before talking about precision.
 
-**基线台账**（2026-09-19 刷新 @ commit `f7fa0877`）：
-- ✅ 已刷新（附 `.rev` sidecar）：`benchmarks/results/{img}__{backend}__{prec}.sdf.bin`
-  及同名 `.obj`（blue_cat/cute_horse/fox/robot × cpu/cuda/vulkan × f32/f16/q8，
-  36 组合）。健全性：全 finite；blue_cat 交叉 PSNR——vulkan/f32 60.0dB、
-  vulkan/f16 58.4dB、cuda/f16 53.7dB、q8 ~38.6dB（量化水平，符合预期）。
-- ✅ 已清理（2026-09-19，`benchmarks/clean_stale_baselines.sh`）：旧 bench
-  草稿 `_bench_*.obj` ×9 与旧版 SDF 集合 `results/sdf/` ×36，共 45 个文件。
-  重跑新基线后再次出现同名残留时重跑该脚本即可（支持 --dry-run）。
-- ⚠️ 遗留未刷新产物（旧代码生成、无 sidecar，下次合入时决定去留）：
-  - `results/cute_horse_{official_,}tex.{obj,mtl,png}`、`ggml_texmap_*.png`、
-    `texmap_ggml_vs_official_*.png`、`tex_*.png`、`tex_render_vs_true.png`、
-    `e2e_tex_clean_compare.png` —— 纹理映射视觉对比（README 引用部分图），
-    视觉产物非数值基线，重跑 texmap 流程可再生
-  - `results/render_*.png`、`pytorch_vs_ggml_*.png`（README 引用）、
-    `precision_*.png`、`latency*.png`、`perf_*.png`、`*.csv`、`report.md`、
-    `PERFORMANCE.md` —— 历史性能/精度报告，重跑 `bench_full.py` 可再生
-  - `results/bench.log`、`times.csv`、`full_bench.csv`、`stage_times*.csv` ——
-    旧耗时记录，刷新基线时应随跑重写
-- ✅ 无需刷新（非 C++ 产物）：`benchmarks/fixtures/e2e/cute_horse/`（官方
-  PyTorch per-step fixture，C++ 重编不影响）；`benchmarks/pytorch_ref/*__pytorch.obj`。
-- ⚠️ **已澄清（2026-09-19）**：`fixtures/e2e/cute_horse/ref_grid.png`、
-  `ref_view_0..5.png` 的 git 修改状态**不是 C++ 输出覆盖**——证据：所有
-  ref_* 文件（含 untracked 的 ref_latents.bin 等 531 个）mtime 为同一秒
-  （04:08:29），是 `convert/dump_e2e.py`（官方 torch 参考生成脚本）的一次
-  完整重跑；C++ 输出文件名不同（grid.png / view_*.png）。torch GPU 推理
-  非确定导致像素漂移（vs HEAD 版 mean diff ~23-26），属**有意的参考重生成**。
-  已验证新 fixture 集内部自洽且与 C++ 对齐：`zero123pp --fixture-dir
-  benchmarks/fixtures/e2e/cute_horse --device vulkan`（f16 UNet 重放 75 步）
-  vs 重生成后的 ref_latents.bin = max 0.81 / mean 3.3e-3 / **PSNR 43.0dB**
-  （f16 重放舍入水平）。保留新版本；注意 C++ 自由采样（无 fixture）的
-  latents 与 ref_latents 本就不可比（噪声序列不同），只有 fixture 重放
-  模式可对比。
+**Baseline ledger** (refreshed 2026-09-19 @ commit `f7fa0877`):
+- ✅ Refreshed (with `.rev` sidecar): `benchmarks/results/{img}__{backend}__{prec}.sdf.bin`
+  and matching `.obj` (blue_cat/cute_horse/fox/robot × cpu/cuda/vulkan × f32/f16/q8,
+  36 combinations). Sanity: all finite; blue_cat cross PSNR — vulkan/f32 60.0dB,
+  vulkan/f16 58.4dB, cuda/f16 53.7dB, q8 ~38.6dB (quantization level, expected).
+- ✅ Cleaned (2026-09-19, `benchmarks/clean_stale_baselines.sh`): old bench
+  drafts `_bench_*.obj` ×9 and the old SDF set `results/sdf/` ×36, 45 files
+  total. If the same stale files reappear after a rerun, just run the script
+  again (supports --dry-run).
+- ⚠️ Leftover unrefreshed artifacts (generated by old code, no sidecar; decide
+  keep/delete at next integration):
+  - `results/cute_horse_{official_,}tex.{obj,mtl,png}`, `ggml_texmap_*.png`,
+    `texmap_ggml_vs_official_*.png`, `tex_*.png`, `tex_render_vs_true.png`,
+    `e2e_tex_clean_compare.png` — texture-mapping visual comparisons (some
+    referenced by README); visual artifacts, not numeric baselines,
+    regenerable by rerunning the texmap flow
+  - `results/render_*.png`, `pytorch_vs_ggml_*.png` (README references),
+    `precision_*.png`, `latency*.png`, `perf_*.png`, `*.csv`, `report.md`,
+    `PERFORMANCE.md` — historical performance/precision reports,
+    regenerable by rerunning `bench_full.py`
+  - `results/bench.log`, `times.csv`, `full_bench.csv`, `stage_times*.csv` —
+    old timing records; rewrite alongside the next baseline refresh
+- ✅ No refresh needed (non-C++ artifacts): `benchmarks/fixtures/e2e/cute_horse/`
+  (official PyTorch per-step fixture, unaffected by C++ rebuilds);
+  `benchmarks/pytorch_ref/*__pytorch.obj`.
+- ⚠️ **Clarified (2026-09-19)**: the git-modified state of
+  `fixtures/e2e/cute_horse/ref_grid.png` and `ref_view_0..5.png` is **not a
+  C++ output overwrite** — evidence: all ref_* files (including the untracked
+  ref_latents.bin etc., 531 files) share the same-second mtime (04:08:29),
+  i.e. one full re-run of `convert/dump_e2e.py` (the official torch reference
+  generator); C++ output filenames differ (grid.png / view_*.png). torch GPU
+  inference is non-deterministic and caused pixel drift (vs the HEAD version,
+  mean diff ~23-26) — an **intentional reference regeneration**. The new
+  fixture set is verified internally self-consistent and aligned with C++:
+  `zero123pp --fixture-dir benchmarks/fixtures/e2e/cute_horse --device vulkan`
+  (f16 UNet replay, 75 steps) vs the regenerated ref_latents.bin = max 0.81 /
+  mean 3.3e-3 / **PSNR 43.0dB** (f16 replay rounding level). Keep the new
+  version; note C++ free sampling (no fixture) latents are incomparable to
+  ref_latents by design (different noise sequences) — only the fixture-replay
+  mode is comparable.
 
-### 端到端 vs PyTorch 全矩阵验收（2026-09-19，发现并修复 2 个真实不一致点）
+### End-to-end vs PyTorch full-matrix acceptance (2026-09-19; two real inconsistencies found and fixed)
 
-以 cute_horse 官方 fixture 为锚，对 `{cuda, vulkan} × {f32, f16}` 做了
-组件级（test_clip_vision / test_vae / test_unet，直接对比 torch dump）+
-75 步 E2E 重放（逐级中间张量 + grid PNG）的 vs torch 全矩阵实测。发现：
+Anchored on the cute_horse official fixture, a full vs-torch matrix was
+measured for `{cuda, vulkan} × {f32, f16}`: component level (test_clip_vision
+/ test_vae / test_unet, directly against torch dumps) + 75-step E2E replay
+(per-stage intermediates + grid PNG). Findings:
 
-1. **CUDA TF32 陷阱（已修复）**：ggml-cuda 对每个 cuBLAS handle 无条件
-   `cublasSetMathMode(CUBLAS_TF32_TENSOR_OP_MATH)`——f32 matmul 被砍到
-   10-bit mantissa：`test_clip_vision` 1.49e-3、`test_vae` encode 6e-2
-   （Vulkan/CPU 均为 ~1e-6/1e-4 水平）。**Vulkan coopmat 的 f32→f16 暂存
-   （9-18 已修）在 CUDA 的孪生问题**。修复：新 patch
-   `patches/ggml-cuda-f32-matmul-exact.patch` 默认 `CUBLAS_DEFAULT_MATH`
-   （精确 FMA），`GGML_CUDA_TF32=1` 显式退出。修复后 clip_vision
-   1.24e-5（PASS）；GeForce 上 TF32 吞吐本就等于 fp32 CUDA core，
-   性能无损；f16/q8 tensor-core 路径不受影响（双向开关复现验证过）。
-   **连带修正一个历史偏差**：此前 `analyze.py` 以 f32-CUDA 为"最高保真
-   参考"，实际带着 TF32 误差；修复后该假设才真正成立。
-2. **zero123pp VAE decode 输出读序错误（已修复）**：`vae_decode` 返回的
-   内存是 torch `[B,3,H,W]`（通道平面序，见 `vae.cpp` L382 注释），而
-   zero123pp 的 PNG 写出按 HWC 交错序线性读——通道平面被错切、RGB 混叠，
-   输出 grid 是"多块灰白拼贴"。**latents PSNR 51.7dB 的验收完全发现不了
-   它**（错在 decode 之后的 host 后处理）；C++ 内部跨后端 grid 互比也
-   发现不了（两边同错抵消出 54.9dB）。修复读序后：**decode(fixture
-   ref_latents) vs ref_grid = 62.2dB**，视觉逐像素一致（见
-   `zero123pp --latents-in`，为定位新增的调试入口）。教训：**vs torch 的
-   一致性必须至少有一次像素级/视觉级验证，纯张量统计可以全部达标而图像
-   全错**。
-3. **VAE encode CUDA 的第二个误差源（已定位并修复）**：TF32 math-mode 修复后
-   `test_vae` encode 仍 1.45e-2（CPU 2.4e-4 / Vulkan 1.3e-4）。经
-   `scripts/vae_encode_bisect.sh` 逐层二分：主链相对误差恒定 1.4e-6（正常），
-   **唯一跳变点 = `encoder.convout`（rel 3.8e-4，跳升 270 倍）**。根因：
-   `ggml_cuda_should_use_mmf` 的 F32 分支在 Ampere 上放行 **fp32 MMA =
-   TF32 tensor core**（10-bit mantissa），且仅 `src1_ncols <= 16` 的薄层命中
-   ——encoder 尾部 conv_out/quant_conv（4 通道输出）正好命中，down 块/
-   resnet（128/256 通道）走 cuBLAS 不受影响。该路径绕开 cuBLAS，故
-   math-mode/FORCE_CUBLAS 均不响应。修复：mmf 的 F32 分支与
-   `GGML_CUDA_TF32` 语义统一（默认关闭，`=1` 恢复）。修复后 encode
-   **1.47e-4 PASS**；`GGML_CUDA_TF32=1` 逐位复现 5.97e-2 的旧行为（归因
-   闭环）。bisect 脚本首跑曾暴露两处脚本健壮性问题（FAIL 判定不应中断
-   采集、对比目录需清空），已随修复一并处理。
+1. **CUDA TF32 trap (fixed)**: ggml-cuda unconditionally set
+   `cublasSetMathMode(CUBLAS_TF32_TENSOR_OP_MATH)` on every cuBLAS handle —
+   f32 matmuls were cut to 10-bit mantissas: `test_clip_vision` 1.49e-3,
+   `test_vae` encode 6e-2 (Vulkan/CPU both at ~1e-6/1e-4). **The CUDA twin of
+   Vulkan's coopmat f32→f16 staging (fixed 9-18)**. Fix: new patch
+   `patches/ggml-cuda-f32-matmul-exact.patch` defaults to
+   `CUBLAS_DEFAULT_MATH` (exact FMA), `GGML_CUDA_TF32=1` opts out. After the
+   fix clip_vision is 1.24e-5 (PASS); on GeForce TF32 throughput already
+   equals fp32 CUDA cores so performance is unchanged; f16/q8 tensor-core
+   paths are unaffected (bidirectional switch reproduces the old numbers).
+   **Also corrects a historical bias**: `analyze.py` treated f32-CUDA as the
+   "highest-fidelity reference" while it actually carried TF32 error; only
+   after the fix is that assumption true.
+2. **zero123pp VAE decode output read-order bug (fixed)**: the memory returned
+   by `vae_decode` is torch `[B,3,H,W]` (channel planes; see the `vae.cpp`
+   L382 comment), but zero123pp's PNG writer read it linearly as interleaved
+   HWC — channel planes got mis-sliced and RGB mixed, and the grid came out
+   as "grey shuffled tiles". The **51.7dB latents acceptance could not see it**
+   (the bug is in host post-processing after decode), and the C++-internal
+   cross-backend grid comparison could not either (same-mistake cancellation,
+   54.9dB). After fixing the read order: **decode(fixture ref_latents) vs
+   ref_grid = 62.2dB**, pixel-identical visually (see `zero123pp
+   --latents-in`, a debug entry point added for this localization). Lesson:
+   **vs-torch consistency requires at least one pixel-level/visual check;
+   pure tensor statistics can pass while the image is completely wrong**.
+3. **The second VAE-encode CUDA error source (located and fixed)**: after the
+   TF32 math-mode fix, `test_vae` encode was still 1.45e-2 (CPU 2.4e-4 /
+   Vulkan 1.3e-4). Bisection via `scripts/vae_encode_bisect.sh`: the main
+   chain's relative error is flat at 1.4e-6 (normal), and the **only jump is
+   `encoder.convout` (rel 3.8e-4, a 270× jump)**. Root cause:
+   `ggml_cuda_should_use_mmf`'s F32 branch admitted **fp32 MMA = TF32 tensor
+   core** on Ampere (10-bit mantissa), and only thin layers with
+   `src1_ncols <= 16` hit it — the encoder tail conv_out/quant_conv (4-channel
+   output) matches, while down blocks/resnets (128/256 channels) go through
+   cuBLAS and are unaffected. That path bypasses cuBLAS, so math-mode and
+   FORCE_CUBLAS are both blind to it. Fix: mmf's F32 branch is gated by
+   `GGML_CUDA_TF32` (off by default, `=1` restores). After the fix encode is
+   **1.47e-4 PASS**; `GGML_CUDA_TF32=1` reproduces the old 5.97e-2 bit-exact
+   (attribution closed). The bisect script's first run also exposed two script
+   robustness issues (a FAIL verdict should not abort collection; compare
+   dirs must be cleared), fixed alongside.
 
-修复后 vs torch E2E 矩阵（cute_horse fixture 重放 75 步，grid/view 为
-PNG 像素 PSNR）：
+Post-fix vs-torch E2E matrix (cute_horse fixture replay, 75 steps; grid/view
+are PNG pixel PSNR):
 
-| 配置 | final latents | grid.png | view_0 |
+| Config | final latents | grid.png | view_0 |
 |---|---|---|---|
-| cuda/f16 | 51.68dB（mean 4.9e-3） | 50.23dB | 52.74dB |
+| cuda/f16 | 51.68dB (mean 4.9e-3) | 50.23dB | 52.74dB |
 | cuda/f32 | 51.61dB | 50.08dB | 52.52dB |
-| vulkan/f16 | 54.29dB（mean 3.3e-3） | 49.30dB | 52.41dB |
+| vulkan/f16 | 54.29dB (mean 3.3e-3) | 49.30dB | 52.41dB |
 | vulkan/f32 | 54.57dB | 49.49dB | 52.57dB |
 
-latents 的 max_abs 离群（0.6-0.8）是 torch fp16 fixture 的表示噪声经
-ancestral 采样末段混沌放大的固有水平（fixture latents 本身是 f16 值），
-对最终图像的影响 < 0.31 像素（grid 50dB）。组件级：UNet f16 双 pass
-cuda 9.4e-4 / vulkan 5.1e-4（f16 量化水平）；VAE decode
-cuda 3.1e-3 / vulkan 2.9e-3；CLIP（修复后）cuda 1.24e-5 / vulkan 4.2e-6；
-scheduler bit-exact。几何管线（dino/lrm/synth/flexicubes）vs torch 的
-CPU 三精度 parity 见 PLAN.md（f32 3e-7 ~ q8 3.4e-2），GPU 路径由
-`benchmarks/results` 36 组合基线（@ f7fa0877）锚定 cpu f32 参考。
-zero123pp 无 q8 权重（quantized 覆盖 = rmbg/dino/lrm/synthesizer 的
-q8 GGUF）。
+The latents max_abs outliers (0.6-0.8) are the inherent level of the torch
+fp16 fixture's representation noise chaotically amplified over the last
+ancestral steps (the fixture latents are themselves f16 values); impact on
+the final image <0.31 pixel (grid 50dB). Component level: UNet f16 double
+pass cuda 9.4e-4 / vulkan 5.1e-4 (f16 quantization level); VAE decode
+cuda 3.1e-3 / vulkan 2.9e-3; CLIP (after fix) cuda 1.24e-5 / vulkan 4.2e-6;
+scheduler bit-exact. Geometry (dino/lrm/synth/flexicubes) vs torch CPU
+three-precision parity is in PLAN.md (f32 3e-7 ~ q8 3.4e-2); GPU paths are
+anchored to the cpu f32 reference via the 36-combination baseline in
+`benchmarks/results` (@ f7fa0877). zero123pp has no q8 weights (quantized
+coverage = rmbg/dino/lrm/synthesizer q8 GGUF).
 
-### 峰值显存优化：stage 权重卸载（GgufModel::unload）
+### Peak VRAM optimization: stage weight unloading (GgufModel::unload)
 
-2026-09-19 实测确认 zero123pp 的进程 VRAM 峰值出现在 VAE decode 阶段
-（f16 11593 MiB / 12GB）。原因：扩散结束后 UNet（f16 1.7GB / f32 3.3GB）
-与 CLIP/cond GGUF（2.4GB）的权重仍驻留，而它们在 decode 中已无参与。
+Measured 2026-09-19: zero123pp's process VRAM peak occurs at the VAE decode
+stage (f16 11593 MiB / 12GB). Reason: after diffusion, UNet (f16 1.7GB / f32
+3.3GB) and CLIP/cond GGUF (2.4GB) weights are still resident while no longer
+participating in decode.
 
-已实现 `GgufModel::unload()`（`core/gguf_io.{hpp,cpp}`）：显式释放权重
-backend buffer + 元数据（此前析构只释放元数据，backend buffer 从无释放
-路径）。全管线的卸载点（按"权重最后一次使用后立即释放"原则布置）：
+Implemented `GgufModel::unload()` (`core/gguf_io.{hpp,cpp}`): explicitly
+releases the weight backend buffer + metadata (previously the destructor only
+freed metadata; the backend buffer had no release path). Unload points across
+the pipeline (placed by the "release immediately after last use" principle):
 
-| 管线 | 卸载点 | 释放量 |
+| Pipeline | Unload point | Freed |
 |---|---|---|
-| zero123pp | CLIP 编码 + scheduler KV 读取完成后、扩散循环前：`clip.gguf.unload()` | 2.4GB |
-| zero123pp | 扩散循环结束、VAE decode 前：`unet.gguf.unload()` | 1.7GB (f16) / 3.3GB (f32) |
-| instantmesh | DINO 编码完成后：`dino.gguf.unload()` | 0.2GB (f16) / 0.4GB (f32) |
-| instantmesh | TriplaneTransformer 后、synthesizer（管线峰值阶段）前：`trans.gguf.unload()` | 0.5GB (f16) / 1.0GB (f32) |
+| zero123pp | after CLIP encode + scheduler KV reads, before the diffusion loop: `clip.gguf.unload()` | 2.4GB |
+| zero123pp | after the diffusion loop, before VAE decode: `unet.gguf.unload()` | 1.7GB (f16) / 3.3GB (f32) |
+| instantmesh | after DINO encode: `dino.gguf.unload()` | 0.2GB (f16) / 0.4GB (f32) |
+| instantmesh | after TriplaneTransformer, before synthesizer (the pipeline peak stage): `trans.gguf.unload()` | 0.5GB (f16) / 1.0GB (f32) |
 
-VAE 权重不能整 buffer 卸载（encoder/decoder 共用一个 GGUF buffer；decode
-仍需 decoder 子集）——按子图拆分需改分配策略，暂不采用。
+VAE weights cannot be unloaded as a whole buffer (encoder/decoder share one
+GGUF buffer; decode still needs the decoder subset) — splitting by subgraph
+would require changing the allocation strategy; not adopted for now.
 
-**实测（4 步短跑 + 0.3s 采样）：zero123pp f16 全流程峰值 11593 →
-8192 MiB**，与释放量吻合；**f32 路径 VAE decode 随之修复**（见上）。
-结构上无数值影响（释放只发生在该 stage 输出已落到 host 之后）。
+**Measured (4-step short run + 0.3s sampling): zero123pp f16 whole-run peak
+11593 → 8192 MiB**, matching the freed amounts; **the f32 path's VAE decode
+is fixed accordingly** (see above). Structurally neutral to numerics
+(releases only happen after that stage's output has landed in host memory).
 
-**析构路径审查结论（2026-09-19）**：全仓 backend buffer 只经
-`GgufModel`（`ggml_backend_alloc_ctx_tensors` 唯一调用点）分配，unload()
-补上释放路径后无遗漏；`ggml_gallocr_new/free` 9 处全部配对；graph 输入
-张量随 gallocr 释放；`read_backend_tensor` 读入 host 的数据不占 VRAM；
-main 尾部 `ggml_backend_free(backend)` 兜底。clip 的 text_emb 等常量在
-unload cond 前已读入 host vector，不受影响。
+**Destructor-path audit (2026-09-19)**: all backend buffers in the repo are
+allocated through `GgufModel` (the only `ggml_backend_alloc_ctx_tensors` call
+site); after unload() gained the release path there are no gaps; all 9
+`ggml_gallocr_new/free` sites are paired; graph input tensors are freed with
+the gallocr; `read_backend_tensor` data read into host does not occupy VRAM;
+`ggml_backend_free(backend)` at main's tail is the backstop. clip's text_emb
+and other constants are read into host vectors before cond is unloaded —
+unaffected.

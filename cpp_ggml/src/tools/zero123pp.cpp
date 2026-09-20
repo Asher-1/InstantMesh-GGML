@@ -490,7 +490,7 @@ int main(int argc, char ** argv) {
     // ── postprocess: unscale_latents → VAE.decode → unscale_image → u8 ─────
     // Free the UNet weights before decode (1.7GB f16 / 3.3GB f32): decode is
     // the process VRAM peak stage and the UNet no longer participates
-    // (ALIGNMENT.md "12GB 卡 VRAM 预算"). No numerical effect.
+    // (ALIGNMENT.md "12GB VRAM budget"). No numerical effect.
     unet.gguf.unload();
 
     if (dump_lat) {

@@ -282,7 +282,7 @@ int main(int argc, char ** argv) {
     std::printf("dino output: [%d, %d, %d]\n", V, seq, hidden);
     // DINO weights are done here (feats already in host memory) — drop them
     // before the synthesizer stage, the pipeline's VRAM peak, and keep the
-    // resident set minimal on 12GB cards (ALIGNMENT.md "12GB 卡 VRAM 预算").
+    // resident set minimal on 12GB cards (ALIGNMENT.md "12GB VRAM budget").
     dino.gguf.unload();
 
     // ---- Stage 2: TriplaneTransformer ------------------------------------

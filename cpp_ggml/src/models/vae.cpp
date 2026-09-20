@@ -309,7 +309,7 @@ float * vae_encode_mode(const VaeModel & m, const float * image,
     // recycles output-flagged buffers (ggml-alloc.c "graph outputs are never
     // freed"), while ordinary dead tensors are reused by later nodes right
     // after their direct consumers run — which previously corrupted every
-    // staged dump (the historical "galloc 复用干扰").
+    // staged dump (the historical "galloc reuse interference").
     ggml_set_output(result_t);
     if (dump) {
         for (auto * t : dump_t) { ggml_set_output(t); ggml_build_forward_expand(gf, t); }

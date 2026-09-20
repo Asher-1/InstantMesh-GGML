@@ -14,7 +14,7 @@
 # exact.patch), test_vae encode on CUDA still shows max 1.45e-2 vs the torch
 # fp32 reference (CPU 2.4e-4 / Vulkan 1.3e-4) — a second, unlocated error
 # source. This script reproduces the tap workflow for bisecting it
-# (docs/ALIGNMENT.md "端到端 vs PyTorch 全矩阵验收", issue 3).
+# (docs/ALIGNMENT.md "End-to-end vs PyTorch full-matrix acceptance", issue 3).
 set -euo pipefail
 
 DEV="${1:-cuda}"

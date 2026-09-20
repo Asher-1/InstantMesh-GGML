@@ -251,8 +251,8 @@ idempotent skip; conflict → error and abort. See
 | Texture-map baking (xatlas + multi-view) | ✅ OBJ+MTL+PNG (official has no PBR, no alignment needed) |
 | f32 / f16 / q8 precisions | ✅ |
 | CUDA / Vulkan / CPU backends | ✅ runtime auto-detection (explicit device via test argv / `--device`) |
-| Zero123++ multi-view diffusion (single image → 6 views) | ✅ `zero123pp` tool: scheduler / CLIPVision / VAE / UNet(RefOnly) 逐组件 parity 全过；E2E PSNR 验收进行中 |
-| rembg foreground segmentation (BiRefNet, RMBG-2.0) | ✅ `rembg` tool + ggml custom ops patch；尚未接入 instantmesh 单命令链 |
+| Zero123++ multi-view diffusion (single image → 6 views) | ✅ `zero123pp` tool: scheduler / CLIPVision / VAE / UNet(RefOnly) per-component parity all pass; E2E PSNR acceptance in progress |
+| rembg foreground segmentation (BiRefNet, RMBG-2.0) | ✅ `rembg` tool + ggml custom ops patch; not yet chained into the single-command instantmesh pipeline |
 | NeuralRender / GLB export | ⏳ planned |
 
 Full technical design and implementation notes: [../docs/PLAN.md](../docs/PLAN.md).
