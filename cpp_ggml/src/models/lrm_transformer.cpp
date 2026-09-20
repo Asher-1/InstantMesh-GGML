@@ -100,6 +100,9 @@ ggml_tensor * multihead_attn(ggml_context * ctx, ggml_tensor * q,
     // flash path is both faster and numerically identical on this ggml rev.
     float scale = 1.0f / std::sqrt((float) head_dim);
     ggml_tensor * out = ggml_flash_attn_ext(ctx, q, k, v, nullptr, scale, 0.0f, 0.0f);
+    // Same note as dino.cpp: CUDA fattn ignores prec today (verified
+    // bit-identical); IM_FLASH_F32=1 is a hook for when upstream honors it.
+    if (std::getenv("IM_FLASH_F32")) ggml_flash_attn_ext_set_prec(out, GGML_PREC_F32);
     if (dbg_tag) probe_register(std::string(dbg_tag) + ".fa", out);
     out = ggml_cont(ctx, out); // flash output may be non-contiguous for batch>1
     return ggml_reshape_3d(ctx, out, hidden, q_seq, batch);

@@ -142,6 +142,11 @@ ggml_tensor * dino_layer(ggml_context * ctx, const DinoModel & m,
     // v0.18.0; fixed in v0.18.1 and verified numerically identical).
     float scale = 1.0f / std::sqrt((float) head_dim);
     ggml_tensor * attn = ggml_flash_attn_ext(ctx, q, k, v, nullptr, scale, 0.0f, 0.0f); // [hd, nh, seq, B]
+    // CUDA fattn currently IGNORES this prec: K/Q are hard-converted to fp16
+    // in-kernel (2e-3 gate) — verified bit-identical with/without, zero speed
+    // cost. Kept as a hook: set IM_FLASH_F32=1 to pick up f32 attention math
+    // once upstream ggml honors prec on the CUDA fattn path.
+    if (std::getenv("IM_FLASH_F32")) ggml_flash_attn_ext_set_prec(attn, GGML_PREC_F32);
     attn = ggml_cont(ctx, attn); // flash output may be non-contiguous for batch>1
     attn = ggml_reshape_3d(ctx, attn, hp.hidden_size, seq, batch);
     if (i == 0) l0_dump(ctx, attn, "attn_raw");
